@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>anyapi-mcp - one MCP server for almost any HTTP API</title>
+  <meta name="description" content="One local MCP server that lets your model talk to almost any HTTP API: OpenAPI, GraphQL, or SOAP/WSDL. Install with a single command.">
+  <meta name="theme-color" content="#0b0e13">
+  <meta property="og:title" content="anyapi-mcp">
+  <meta property="og:description" content="One local MCP server for almost any HTTP API. Point it at an OpenAPI spec, a GraphQL endpoint, or a SOAP/WSDL service and your model can call it right away.">
+  <meta property="og:type" content="website">
+  <style>
+    :root {
+      --bg: #0b0e13;
+      --panel: #11151d;
+      --border: #232b38;
+      --text: #e7ebf2;
+      --muted: #93a0b4;
+      --accent: #5eead4;
+      --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 760px; margin: 0 auto; padding: 0 24px; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 28px 0;
+    }
+    .brand { font-family: var(--mono); font-weight: 600; letter-spacing: -0.02em; }
+    .brand::before { content: "› "; color: var(--accent); }
+    header nav a { color: var(--muted); font-size: 0.92rem; }
+    main { padding: 32px 0 64px; }
+    h1 {
+      font-size: clamp(1.9rem, 5vw, 2.8rem);
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+      margin: 0 0 18px;
+    }
+    .lede { font-size: 1.12rem; color: var(--muted); margin: 0 0 36px; max-width: 62ch; }
+    .install { margin: 0 0 14px; }
+    .label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .cmd {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .cmd code {
+      font-family: var(--mono);
+      font-size: 0.95rem;
+      overflow-x: auto;
+      white-space: nowrap;
+      flex: 1;
+    }
+    .cmd .prompt { color: var(--accent); user-select: none; margin-right: 8px; }
+    .copy {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--text);
+      background: #1b212c;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 6px 12px;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .copy:hover { border-color: var(--accent); color: var(--accent); }
+    .req { color: var(--muted); font-size: 0.9rem; margin: 12px 2px 0; }
+    section { margin-top: 56px; }
+    h2 {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--muted);
+      font-weight: 600;
+      margin: 0 0 18px;
+    }
+    ol.steps { margin: 0; padding-left: 20px; }
+    ol.steps li { margin-bottom: 8px; }
+    code.inline {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 1px 6px;
+    }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+    .card h3 { font-family: var(--mono); font-size: 0.98rem; margin: 0 0 6px; color: var(--accent); }
+    .card p { margin: 0; font-size: 0.9rem; color: var(--muted); }
+    .note { color: var(--muted); font-size: 0.95rem; margin-top: 16px; }
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 24px 0 48px;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    @media (max-width: 560px) {
+      .grid { grid-template-columns: 1fr; }
+      .cmd code { font-size: 0.82rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">anyapi-mcp</div>
+      <nav><a href="https://github.com/gabrielbauman/anyapi-mcp">GitHub →</a></nav>
+    </header>
+
+    <main>
+      <h1>One MCP server for almost any HTTP API.</h1>
+      <p class="lede">
+        Point it at an OpenAPI spec, a GraphQL endpoint, or a SOAP/WSDL service,
+        and your model can search and call it right away, driving a typed
+        client by writing code instead of one MCP tool per endpoint.
+      </p>
+
+      <div class="install">
+        <div class="label">Install</div>
+        <div class="cmd">
+          <code><span class="prompt">$</span>curl -fsSL https://gabrielbauman.github.io/anyapi-mcp/install.sh | sh</code>
+          <button class="copy" data-copy="curl -fsSL https://gabrielbauman.github.io/anyapi-mcp/install.sh | sh">Copy</button>
+        </div>
+        <p class="req">
+          Builds from source · needs <a href="https://deno.com/">Deno</a> 2.x ·
+          macOS or Linux
+        </p>
+      </div>
+
+      <section>
+        <h2>Then</h2>
+        <ol class="steps">
+          <li><code class="inline">anyapi-mcp install</code> - register it with Claude Code and/or Claude Desktop.</li>
+          <li><code class="inline">anyapi-mcp add &lt;spec-url&gt;</code> - point it at an API.</li>
+          <li>Ask your model to use it. It searches, writes a short program, and runs it.</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>Three tools, not three hundred</h2>
+        <div class="grid">
+          <div class="card">
+            <h3>search</h3>
+            <p>Find the operations you need by keyword.</p>
+          </div>
+          <div class="card">
+            <h3>execute</h3>
+            <p>Run TypeScript against a typed client in a locked-down sandbox.</p>
+          </div>
+          <div class="card">
+            <h3>add_api</h3>
+            <p>Register more APIs on the fly, no restart.</p>
+          </div>
+        </div>
+        <p class="note">
+          The model writes code and runs it; intermediate results stay in the
+          sandbox instead of round-tripping through the model, so a ten-step
+          workflow costs one tool call and a handful of tokens, not ten.
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      <a href="https://github.com/gabrielbauman/anyapi-mcp">github.com/gabrielbauman/anyapi-mcp</a>
+      · Apache-2.0
+    </footer>
+  </div>
+
+  <script>
+    document.querySelectorAll(".copy").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var text = btn.getAttribute("data-copy");
+        if (!navigator.clipboard) return;
+        navigator.clipboard.writeText(text).then(function () {
+          var prev = btn.textContent;
+          btn.textContent = "Copied";
+          setTimeout(function () { btn.textContent = prev; }, 1200);
+        });
+      });
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "license": "Apache-2.0",
+  "tasks": {
+    "dev": "deno run -A src/main.ts",
+    "compile": "deno compile -A --output anyapi-mcp src/main.ts",
+    "check": "deno check src/main.ts",
+    "lint": "deno lint src/",
+    "fmt": "deno fmt --check"
+  },
+  "fmt": {
+    "exclude": ["site/"]
+  },
+  "imports": {
+    "@modelcontextprotocol/sdk/": "npm:/@modelcontextprotocol/sdk@1.29.0/",
+    "@std/cli": "jsr:@std/cli@^1.0.30",
+    "@std/fs": "jsr:@std/fs@^1.0.24",
+    "@std/path": "jsr:@std/path@^1.1.5",
+    "fast-xml-parser": "npm:fast-xml-parser@^4.5.6",
+    "zod": "npm:zod@4.4.3"
+  },
+  "compilerOptions": {
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}

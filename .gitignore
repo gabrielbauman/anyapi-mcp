@@ -1,0 +1,9 @@
+# Compiled binary produced by `deno task compile`
+/anyapi-mcp
+
+# Per-user local Claude Code settings
+.claude/settings.local.json
+
+# Local scratch
+*.local
+.DS_Store
