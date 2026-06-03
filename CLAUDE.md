@@ -60,7 +60,7 @@ protocol plugs in through one in-tree adapter object.
 
 ## v1 scope
 
-JSON OpenAPI specs — OpenAPI 3.x, or Swagger 2.0 auto-converted to 3.0 via
-swagger2openapi (convert YAML first) — GraphQL endpoints, SOAP/WSDL (WSDL 1.1,
+OpenAPI specs in JSON or YAML — OpenAPI 3.x, or Swagger 2.0 auto-converted to
+3.0 via swagger2openapi — GraphQL endpoints, SOAP/WSDL (WSDL 1.1,
 document/literal). Bearer or no auth. Each `execute` is a fresh subprocess with
 no persisted state.
