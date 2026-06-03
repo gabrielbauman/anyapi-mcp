@@ -11,11 +11,14 @@ import {
   findEntry,
   type OAuth2Auth,
   type RegistryEntry,
+  removeEntry,
+  updateEntry,
 } from "./registry.ts";
 import { writeOpsIndex } from "./operation.ts";
-import { setSecret } from "./keystore.ts";
-import { typesPathFor } from "./paths.ts";
+import { deleteSecret, setSecret } from "./keystore.ts";
+import { opsPathFor, typesPathFor } from "./paths.ts";
 import {
+  clearOAuthSecrets,
   defaultRedirectUri,
   type DiscoveredOAuth,
   quirkForAuthUrl,
@@ -66,6 +69,8 @@ export interface RegisterOptions {
   scopeSeparator?: string;
   /** Register with no auth even if OAuth was discovered. */
   noAuth?: boolean;
+  /** Overwrite an existing entry with the same id instead of failing. */
+  force?: boolean;
   /** Optional progress sink (the CLI passes console.error; the MCP tool omits it). */
   onProgress?: (message: string) => void;
 }
@@ -106,6 +111,75 @@ function resolveOAuth(
 export interface RegisterResult {
   entry: RegistryEntry;
   operationCount: number;
+  /** True when this call overwrote an existing entry with the same id. */
+  overwritten: boolean;
+}
+
+/** Keystore account names a given auth config references (none for kind "none"). */
+function secretAccounts(auth: Auth): string[] {
+  if (auth.kind === "bearer") return [auth.tokenKey];
+  if (auth.kind === "oauth2") return [auth.clientKey, auth.tokenKey];
+  return [];
+}
+
+/**
+ * On overwrite, delete keystore secrets the old auth referenced that the new one
+ * no longer does (e.g. a bearer token left behind when re-registering as no-auth,
+ * or OAuth credentials dropped when switching to bearer). A same-kind re-register
+ * keeps its accounts, so an OAuth API stays logged in across a re-register that
+ * only fixes its base URL.
+ */
+async function cleanupOrphanedSecrets(
+  oldAuth: Auth,
+  newAuth: Auth,
+): Promise<void> {
+  const keep = new Set(secretAccounts(newAuth));
+  for (const account of secretAccounts(oldAuth)) {
+    if (!keep.has(account)) await deleteSecret(account);
+  }
+}
+
+export interface UnregisterResult {
+  /** False when no entry matched the id. */
+  removed: boolean;
+  /** What secrets were cleared (empty string when none, or when not found). */
+  secretsNote: string;
+}
+
+/**
+ * Remove an API: its registry entry, stored secrets (bearer token, or OAuth
+ * client credentials + tokens), and cached artifacts (generated types + ops
+ * index). Shared by the `remove` CLI command and the `remove_api` MCP tool.
+ * Returns removed:false when no entry matches `id`.
+ */
+export async function unregisterApi(id: string): Promise<UnregisterResult> {
+  const entry = await findEntry(id);
+  if (!entry) return { removed: false, secretsNote: "" };
+
+  let secretsNote = "";
+  if (entry.auth.kind === "bearer") {
+    const removed = await deleteSecret(entry.auth.tokenKey);
+    secretsNote = removed ? "deleted bearer token" : "no bearer token stored";
+  } else if (entry.auth.kind === "oauth2") {
+    const { token, client } = await clearOAuthSecrets(entry.auth, {
+      forgetClient: true,
+    });
+    secretsNote = `deleted OAuth secrets (token: ${
+      token ? "yes" : "none"
+    }, client: ${client ? "yes" : "none"})`;
+  }
+
+  await removeEntry(id);
+
+  for (const path of [entry.typesPath, opsPathFor(id)]) {
+    try {
+      await Deno.remove(path);
+    } catch (err) {
+      if (!(err instanceof Deno.errors.NotFound)) throw err;
+    }
+  }
+
+  return { removed: true, secretsNote };
 }
 
 /**
@@ -137,9 +211,11 @@ export async function registerApi(
       "Could not derive an id from the base URL; pass an explicit id.",
     );
   }
-  if (await findEntry(id)) {
+  const existing = await findEntry(id);
+  if (existing && !opts.force) {
     throw new Error(
-      `An API with id "${id}" already exists. Choose another id, or remove it first.`,
+      `An API with id "${id}" already exists. Re-run with force (CLI: --force, ` +
+        `add_api: force:true) to overwrite it, choose another id, or remove it first.`,
     );
   }
 
@@ -175,7 +251,25 @@ export async function registerApi(
     addedAt: new Date().toISOString(),
   };
   if (opts.docsUrl) entry.docsUrl = opts.docsUrl;
-  await appendEntry(entry);
 
-  return { entry, operationCount: prepared.operations.length };
+  if (existing) {
+    // In-place overwrite. The fresh addedAt invalidates serve's ops cache; the
+    // regenerated types/ops files already replaced the old ones at the same
+    // paths; same-id keystore accounts are preserved (an OAuth API stays logged
+    // in). Only drop secrets, and a types file at a now-stale path (kind change),
+    // that the new entry no longer references.
+    await cleanupOrphanedSecrets(existing.auth, entry.auth);
+    if (existing.typesPath !== entry.typesPath) {
+      await Deno.remove(existing.typesPath).catch(() => {});
+    }
+    if (!(await updateEntry(entry))) await appendEntry(entry);
+  } else {
+    await appendEntry(entry);
+  }
+
+  return {
+    entry,
+    operationCount: prepared.operations.length,
+    overwritten: existing !== undefined,
+  };
 }

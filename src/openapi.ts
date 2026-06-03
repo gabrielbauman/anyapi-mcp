@@ -15,6 +15,7 @@ import { parse as parseYaml } from "@std/yaml";
 import { toFileUrl } from "@std/path";
 import { ensureCacheDir } from "./paths.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
+import { clampDescription, clampEnum } from "./operation.ts";
 import type { OperationInfo, OperationParam } from "./operation.ts";
 import type { RegistryEntry } from "./registry.ts";
 import type { DiscoveredOAuth } from "./oauth.ts";
@@ -198,6 +199,31 @@ function schemaHint(root: Json, schemaNode: unknown): string {
   return "any";
 }
 
+/** Stringify a JSON enum list (skipping nulls); undefined if there's nothing usable. */
+function enumValues(v: unknown): string[] | undefined {
+  if (!Array.isArray(v) || v.length === 0) return undefined;
+  const out = v
+    .filter((x) => x !== null && x !== undefined)
+    .map((x) => typeof x === "string" ? x : JSON.stringify(x));
+  return out.length ? out : undefined;
+}
+
+/**
+ * Allowed values for a parameter schema: a direct `enum`, or - for an array
+ * parameter (e.g. Open-Meteo's `daily`/`hourly`) - the `enum` of its items.
+ */
+function schemaEnum(root: Json, schemaNode: unknown): string[] | undefined {
+  const s = obj(resolveRef(root, schemaNode));
+  if (!s) return undefined;
+  const direct = enumValues(s.enum);
+  if (direct) return direct;
+  if (str(s.type) === "array") {
+    const items = obj(resolveRef(root, s.items));
+    if (items) return enumValues(items.enum);
+  }
+  return undefined;
+}
+
 function buildParams(root: Json, rawParams: unknown[]): OperationParam[] {
   const params: OperationParam[] = [];
   for (const raw of rawParams) {
@@ -210,12 +236,20 @@ function buildParams(root: Json, rawParams: unknown[]): OperationParam[] {
       location !== "path" && location !== "query" &&
       location !== "header" && location !== "cookie"
     ) continue;
-    params.push({
+    const param: OperationParam = {
       name,
       in: location,
       required: p.required === true || location === "path",
       type: schemaHint(root, p.schema),
-    });
+    };
+    const description = clampDescription(str(p.description));
+    if (description) param.description = description;
+    const values = schemaEnum(root, p.schema);
+    if (values) {
+      const clamped = clampEnum(values);
+      if (clamped) param.enum = clamped;
+    }
+    params.push(param);
   }
   return params;
 }
@@ -301,18 +335,69 @@ export function discoverOAuth(spec: Json): DiscoveredOAuth | undefined {
 
 // ---- base URL / hosts ----
 
-/** Derive an absolute base URL from servers[0], resolving relative URLs and {vars}. */
-export function resolveBaseUrl(spec: Json, specSource: string): string {
-  const first = obj(arr(spec.servers)[0]);
-  let url = first ? str(first.url) : undefined;
-  if (url) {
-    const vars = first ? obj(first.variables) : undefined;
-    if (vars) {
-      url = url.replace(/\{([^}]+)\}/g, (m, name: string) => {
-        const v = obj(vars[name]);
-        return (v && str(v.default)) ?? m;
-      });
+/**
+ * Hosts that serve raw spec/text files but never a live API. A base URL derived
+ * onto one of these means the spec declared no usable server (or only a relative
+ * one, resolved against wherever the spec itself was fetched), so we fail loudly
+ * instead of silently pointing every request at a file CDN.
+ */
+const SPEC_HOSTING_HOSTS: ReadonlySet<string> = new Set([
+  "raw.githubusercontent.com",
+  "gist.githubusercontent.com",
+  "raw.githack.com",
+  "rawcdn.githack.com",
+  "cdn.jsdelivr.net",
+  "fastly.jsdelivr.net",
+  "cdn.statically.io",
+]);
+
+function looksLikeSpecHostingHost(host: string): boolean {
+  return SPEC_HOSTING_HOSTS.has(host.toLowerCase().split(":")[0]);
+}
+
+/**
+ * The first server object found at the document, path-item, or operation level,
+ * in that precedence order. OpenAPI 3.x allows `servers` at all three levels;
+ * many real specs (Open-Meteo among them) declare it only per-path, where a
+ * top-level-only lookup finds nothing and wrongly falls back to the spec's host.
+ */
+function firstServer(spec: Json): Json | undefined {
+  const top = obj(arr(spec.servers)[0]);
+  if (top) return top;
+  const paths = obj(spec.paths);
+  if (!paths) return undefined;
+  const pathItems = Object.values(paths)
+    .map((p) => obj(resolveRef(spec, p)))
+    .filter((p): p is Json => p !== undefined);
+  for (const pathItem of pathItems) {
+    const s = obj(arr(pathItem.servers)[0]);
+    if (s) return s;
+  }
+  for (const pathItem of pathItems) {
+    for (const method of HTTP_METHODS) {
+      const op = obj(pathItem[method]);
+      const s = op && obj(arr(op.servers)[0]);
+      if (s) return s;
     }
+  }
+  return undefined;
+}
+
+/** Substitute `{var}` placeholders in a server URL with the variables' defaults. */
+function applyServerVars(url: string, server: Json): string {
+  const vars = obj(server.variables);
+  if (!vars) return url;
+  return url.replace(/\{([^}]+)\}/g, (m, name: string) => {
+    const v = obj(vars[name]);
+    return (v && str(v.default)) ?? m;
+  });
+}
+
+function deriveBaseUrl(spec: Json, specSource: string): string {
+  const server = firstServer(spec);
+  const rawUrl = server ? str(server.url) : undefined;
+  if (server && rawUrl) {
+    const url = applyServerVars(rawUrl, server);
     if (isUrl(url)) return stripTrailingSlash(url);
     if (isUrl(specSource)) {
       return stripTrailingSlash(new URL(url, specSource).toString());
@@ -326,6 +411,34 @@ export function resolveBaseUrl(spec: Json, specSource: string): string {
   throw new Error(
     "Could not determine a base URL from the spec; pass --base-url.",
   );
+}
+
+/**
+ * Derive an absolute base URL from the spec's servers (document, path, or
+ * operation level), resolving relative URLs against the spec source and
+ * substituting `{vars}`. Falls back to the spec's own host only when no server
+ * is declared anywhere. Throws if the result lands on a known spec-hosting host
+ * (e.g. raw.githubusercontent.com) - a strong signal the real server was not
+ * found - so the caller fixes it with --base-url instead of registering a broken
+ * API that would send every request to a file CDN.
+ */
+export function resolveBaseUrl(spec: Json, specSource: string): string {
+  const baseUrl = deriveBaseUrl(spec, specSource);
+  let host: string;
+  try {
+    host = new URL(baseUrl).host;
+  } catch {
+    return baseUrl; // relative base from a local spec; hostsFromBaseUrl rejects it
+  }
+  if (looksLikeSpecHostingHost(host)) {
+    throw new Error(
+      `Derived base URL "${baseUrl}" points at ${host}, which hosts raw spec ` +
+        `files rather than a live API - the spec likely declares its server only ` +
+        `per-path/operation or relatively, or not at all. Pass --base-url (CLI) / ` +
+        `baseUrl (add_api) with the real API base, e.g. https://api.example.com.`,
+    );
+  }
+  return baseUrl;
 }
 
 export function hostsFromBaseUrl(baseUrl: string): string[] {

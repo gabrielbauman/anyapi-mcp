@@ -9,9 +9,12 @@
 // The token is injected into the subprocess env only; the model never sees it,
 // and the net allowlist means even hostile code can't ship it elsewhere.
 //
-// Type-checking stays on (`--check`) so the model sees type errors and can
-// self-correct. The module cache is warmed in the parent first (full network),
-// so the sandboxed run needs no registry access to load its imports.
+// Type-checking is on by default (`--check`) so the model sees type errors and
+// can self-correct; a caller may turn it off per call (e.g. when a stale spec
+// enum rejects a value the live API still accepts). Opting out changes nothing
+// about the security boundary above - same net/env allowlist, no read/write/run.
+// The module cache is warmed in the parent first (full network), so the
+// sandboxed run needs no registry access to load its imports.
 
 export interface ExecuteResult {
   stdout: string;
@@ -19,7 +22,22 @@ export interface ExecuteResult {
   exitCode: number;
 }
 
-const TIMEOUT_MS = 30_000;
+export interface SandboxOptions {
+  /** Type-check before running (default true). Off bypasses stale spec enums. */
+  check?: boolean;
+  /** Max wall-clock ms before SIGKILL (default 30000, clamped to [1000, 120000]). */
+  timeoutMs?: number;
+}
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+const MIN_TIMEOUT_MS = 1_000;
+const MAX_TIMEOUT_MS = 120_000;
+
+function clampTimeout(ms: number | undefined): number {
+  if (ms === undefined || !Number.isFinite(ms)) return DEFAULT_TIMEOUT_MS;
+  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.floor(ms)));
+}
+
 /** Env vars the child needs to function (find its module cache, temp dir). */
 const PASSTHROUGH_ENV = ["HOME", "PATH", "DENO_DIR", "TMPDIR"];
 
@@ -47,8 +65,10 @@ export async function runSandboxed(
   source: string,
   hosts: string[],
   token: string | undefined,
+  opts: SandboxOptions = {},
 ): Promise<ExecuteResult> {
   const deno = denoExecutable();
+  const timeoutMs = clampTimeout(opts.timeoutMs);
   const dec = new TextDecoder();
   const tmp = await Deno.makeTempFile({
     prefix: "anyapi-mcp-exec-",
@@ -74,8 +94,11 @@ export async function runSandboxed(
       };
     }
 
-    // 2) Type-check + run, sandboxed.
-    const args = ["run", "--check", "--no-config", "--no-lock"];
+    // 2) (Type-check +) run, sandboxed. --check is opt-out; the allowlists below
+    //    are the security boundary and are unconditional.
+    const args = ["run"];
+    if (opts.check !== false) args.push("--check");
+    args.push("--no-config", "--no-lock");
     if (hosts.length > 0) args.push(`--allow-net=${hosts.join(",")}`);
     args.push("--allow-env=ANYAPI_MCP_TOKEN", tmp);
 
@@ -95,7 +118,7 @@ export async function runSandboxed(
       } catch {
         // already exited
       }
-    }, TIMEOUT_MS);
+    }, timeoutMs);
 
     const { code, stdout, stderr } = await child.output();
     clearTimeout(timer);
@@ -103,7 +126,7 @@ export async function runSandboxed(
     let err = dec.decode(stderr);
     if (timedOut) {
       err += `\nanyapi-mcp: execution timed out after ${
-        TIMEOUT_MS / 1000
+        timeoutMs / 1000
       }s and was killed.`;
     }
     return {

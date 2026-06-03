@@ -8,12 +8,13 @@ integration per API: one server covers everything you register, and it stays
 token-efficient however many calls a task takes.
 
 Under the hood it generates a typed client from the API's own description and
-exposes just three tools: `search` to find operations, `execute` to run a short
-TypeScript program against that client, and `add_api` to register more. Instead
-of one MCP tool per endpoint clogging the context window, the model writes code
-and runs it in a locked-down sandbox; intermediate results stay in that
-subprocess rather than round-tripping through the model, so a ten-step workflow
-costs one tool call and a handful of tokens, not ten.
+exposes a small set of tools: `search` to find operations, `execute` to run a
+short TypeScript program against that client, and `add_api`/`list_apis`/
+`remove_api` to manage what's registered. Instead of one MCP tool per endpoint
+clogging the context window, the model writes code and runs it in a locked-down
+sandbox; intermediate results stay in that subprocess rather than round-tripping
+through the model, so a ten-step workflow costs one tool call and a handful of
+tokens, not ten.
 
 Because that client is fully typed, the model drives the API without guesswork:
 a wrong argument is a type error, caught before any request leaves the machine.
@@ -79,19 +80,24 @@ Inspects the source (an OpenAPI spec, a GraphQL endpoint, or a WSDL), derives
 the base URL and host, builds a searchable operation index, generates a typed
 client, and writes a registry entry.
 
-| Option                            | Description                                                                                             |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `--kind <openapi\|graphql\|soap>` | Protocol (default: `openapi`). `graphql` introspects an endpoint; `soap` reads a WSDL URL.              |
-| `--id <slug>`                     | Id used on the CLI and in `execute` (default: the base URL in reverse-DNS form, e.g. `com.github.api`). |
-| `--name <name>`                   | Human-friendly name (default: spec `info.title`).                                                       |
-| `--base-url <url>`                | Override the base URL derived from the spec's `servers[]`.                                              |
-| `--docs <url>`                    | Documentation URL to store and surface (not parsed).                                                    |
-| `--token`                         | Store a bearer token. Read without echo from a TTY, or piped via stdin.                                 |
-| `--oauth`                         | Treat the API as OAuth 2.0 even if the spec doesn't declare it.                                         |
-| `--auth-url` / `--token-url`      | OAuth authorize / token endpoints (override the spec's values).                                         |
-| `--scope <name>`                  | Scope to request at login (repeatable; default: the spec's scopes).                                     |
-| `--scope-separator <sep>`         | Scope separator in the authorize URL (default `" "`; Strava uses `","`).                                |
-| `--no-auth`                       | Register without authentication.                                                                        |
+| Option                            | Description                                                                                               |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `--kind <openapi\|graphql\|soap>` | Protocol (default: `openapi`). `graphql` introspects an endpoint; `soap` reads a WSDL URL.                |
+| `--id <slug>`                     | Id used on the CLI and in `execute` (default: the base URL in reverse-DNS form, e.g. `com.github.api`).   |
+| `--name <name>`                   | Human-friendly name (default: spec `info.title`).                                                         |
+| `--base-url <url>`                | Override the base URL (otherwise derived from the spec's document-, path-, or operation-level `servers`). |
+| `--docs <url>`                    | Documentation URL to store and surface (not parsed).                                                      |
+| `--token`                         | Store a bearer token. Read without echo from a TTY, or piped via stdin.                                   |
+| `--oauth`                         | Treat the API as OAuth 2.0 even if the spec doesn't declare it.                                           |
+| `--auth-url` / `--token-url`      | OAuth authorize / token endpoints (override the spec's values).                                           |
+| `--scope <name>`                  | Scope to request at login (repeatable; default: the spec's scopes).                                       |
+| `--scope-separator <sep>`         | Scope separator in the authorize URL (default `" "`; Strava uses `","`).                                  |
+| `--no-auth`                       | Register without authentication.                                                                          |
+| `--force`                         | Overwrite an existing API with the same id instead of failing (e.g. to fix a wrong base URL).             |
+
+If the base URL can't be derived and would fall back to a raw spec-hosting host
+(e.g. `raw.githubusercontent.com`), `add` fails loudly instead of registering a
+broken base — pass `--base-url` with the real API origin.
 
 OpenAPI specs that declare an **OAuth 2.0 authorization-code flow are detected
 automatically**: the API is registered as `oauth2`, and you run
@@ -159,12 +165,16 @@ Runs the stdio MCP server. It re-reads the registry on each call (so newly
 registered APIs are picked up without a restart) and exposes:
 
 - **`search`** - `{ query, api? }` → compact operation matches (`api`, `method`,
-  `path`, `operationId`, `summary`, `params`, `requestBodyHint`).
-- **`execute`** - `{ api, code }` → runs `code` against a typed `client` and
-  returns `{ stdout, stderr, exitCode }` verbatim. For OAuth APIs the access
-  token is refreshed automatically first; if the API isn't authenticated, the
-  result explains how to fix it (call `authenticate`, or run
-  `anyapi-mcp login`).
+  `path`, `operationId`, `summary`, `params`, `requestBodyHint`). Each param
+  also carries a `description` and its allowed `enum` values when the spec
+  provides them, so the model can pick valid arguments without a failed call.
+- **`execute`** - `{ api, code, check?, timeoutMs? }` → runs `code` against a
+  typed `client` and returns `{ stdout, stderr, exitCode }` verbatim. For OAuth
+  APIs the access token is refreshed automatically first; if the API isn't
+  authenticated, the result explains how to fix it (call `authenticate`, or run
+  `anyapi-mcp login`). `check:false` skips type-checking for one run (use when a
+  stale spec `enum` rejects a value the live API still accepts); `timeoutMs`
+  raises the 30s default (capped at 120s) for long or paginated runs.
 - **`authenticate`** - `{ api }` → opens the user's browser to (re-)authenticate
   an OAuth API and stores the tokens. Lets the model recover from an expired or
   revoked session without leaving the chat. It never accepts secrets — the user
@@ -176,11 +186,19 @@ registered APIs are picked up without a restart) and exposes:
   authorize/token endpoints (those carry the client secret and stay CLI-only),
   and reserved params like `redirect_uri`/`client_id` are rejected. Call with
   just `{ api }` to read the current config.
-- **`add_api`** - `{ specUrl, kind?, id?, name?, baseUrl?, docsUrl? }` →
+- **`add_api`** - `{ specUrl, kind?, id?, name?, baseUrl?, docsUrl?, force? }` →
   registers a new API (`kind` `openapi`, `graphql`, or `soap`) so the model can
   self-serve public APIs. Secrets are **not** accepted here; for authenticated
   APIs use `anyapi-mcp add … --token` (bearer) or `anyapi-mcp login` (OAuth) so
-  the secret goes to the OS keychain, not the conversation.
+  the secret goes to the OS keychain, not the conversation. `force:true`
+  overwrites an existing id in place (e.g. to correct a wrong `baseUrl`) instead
+  of failing; an OAuth API stays logged in across the overwrite.
+- **`list_apis`** - `{}` → the registered APIs as JSON (id, name, kind, baseUrl,
+  operation count, auth/login status, docsUrl). Lets the model see what's
+  available and confirm an `add_api`/`remove_api` took effect mid-session.
+- **`remove_api`** - `{ api }` → unregisters an API: removes its entry, deletes
+  any stored secrets from the keychain, and cleans up its cached types and ops
+  index. The model's own way to clean up a mistaken registration.
 
 The server also sends MCP `instructions` at connect time describing the
 workflow, and - when the registry is empty - exactly how to register an API.
@@ -293,15 +311,20 @@ and runs it in a `deno` subprocess scoped with:
 - `--allow-env=ANYAPI_MCP_TOKEN` - the only environment variable the code can
   read.
 - no `--allow-read` / `--allow-write` / `--allow-run`.
-- a 30-second timeout.
+- a 30-second timeout by default (raise it per call with `execute`'s
+  `timeoutMs`, capped at 120s).
 
 The token is injected into the subprocess environment only; the model never sees
 it, and the net allowlist means it can't be exfiltrated. For OAuth APIs the
 parent process refreshes the access token (in the keychain) **before** building
 the harness, so the sandbox only ever receives a currently-valid token and never
-touches the refresh token or token endpoint. **Type-checking stays on**
+touches the refresh token or token endpoint. **Type-checking is on by default**
 (`--check`) so the model sees type errors and can self-correct - calling an
-operation with the wrong arguments returns the exact expected shape.
+operation with the wrong arguments returns the exact expected shape. Passing
+`check:false` to `execute` skips type-checking for that one run - useful when a
+spec's `enum` is stale and rejects a value the live API still accepts (the model
+trades type feedback for the call). It removes only `--check`; the net/env
+sandbox above is unchanged.
 
 Writing code with `openapi-fetch`: `response` is always present, so check
 `response.status`; on success `data` is set, on an HTTP error `error` is set (no
