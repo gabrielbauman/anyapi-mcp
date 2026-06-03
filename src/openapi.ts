@@ -17,6 +17,7 @@ import { ensureCacheDir } from "./paths.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
 import type { OperationInfo, OperationParam } from "./operation.ts";
 import type { RegistryEntry } from "./registry.ts";
+import type { DiscoveredOAuth } from "./oauth.ts";
 
 /** Pinned so regenerated types stay stable across machines. */
 const OPENAPI_TS_VERSION = "7.13.0";
@@ -267,6 +268,37 @@ export function buildOperationIndex(spec: Json): OperationInfo[] {
   return operations;
 }
 
+// ---- OAuth discovery ----
+
+/**
+ * Find an OAuth2 authorization-code flow in the spec's security schemes. Runs on
+ * the (already converted) 3.x document, so Swagger 2.0 `securityDefinitions` have
+ * become `components.securitySchemes` with `flows.authorizationCode`. The URLs a
+ * spec advertises can be wrong (Strava's are); callers may override them.
+ */
+export function discoverOAuth(spec: Json): DiscoveredOAuth | undefined {
+  const components = obj(spec.components);
+  const schemes = components && obj(components.securitySchemes);
+  if (!schemes) return undefined;
+  for (const raw of Object.values(schemes)) {
+    const scheme = obj(raw);
+    if (!scheme || str(scheme.type) !== "oauth2") continue;
+    const flows = obj(scheme.flows);
+    const ac = flows && obj(flows.authorizationCode);
+    if (!ac) continue;
+    const authorizationUrl = str(ac.authorizationUrl);
+    const tokenUrl = str(ac.tokenUrl);
+    if (!authorizationUrl || !tokenUrl) continue;
+    const scopeObj = obj(ac.scopes);
+    return {
+      authorizationUrl,
+      tokenUrl,
+      scopes: scopeObj ? Object.keys(scopeObj) : [],
+    };
+  }
+  return undefined;
+}
+
 // ---- base URL / hosts ----
 
 /** Derive an absolute base URL from servers[0], resolving relative URLs and {vars}. */
@@ -380,11 +412,13 @@ export const openapiAdapter: ProtocolAdapter = {
     const baseUrl = opts.baseUrlOverride ?? resolveBaseUrl(spec, source);
     const hosts = hostsFromBaseUrl(baseUrl);
     const operations = buildOperationIndex(spec);
+    const oauth = discoverOAuth(spec);
     return {
       name: specName(spec),
       baseUrl,
       hosts,
       operations,
+      ...(oauth ? { oauth } : {}),
       // openapi-typescript can't read the original Swagger 2.0 `source`, so a
       // converted spec is fed to it as OpenAPI 3.0 instead.
       writeTypes: (outPath: string) =>
@@ -396,9 +430,10 @@ export const openapiAdapter: ProtocolAdapter = {
 
   buildHarness(entry: RegistryEntry, code: string): string {
     const typesUrl = toFileUrl(entry.typesPath).href;
-    const authHeader = entry.auth.kind === "bearer"
-      ? entry.auth.header
-      : "Authorization";
+    const authHeader =
+      entry.auth.kind === "bearer" || entry.auth.kind === "oauth2"
+        ? entry.auth.header
+        : "Authorization";
     return `// AUTO-GENERATED anyapi-mcp execute harness (openapi) - do not edit.
 import createClient from "npm:openapi-fetch@${OPENAPI_FETCH_VERSION}";
 import type { paths } from ${JSON.stringify(typesUrl)};

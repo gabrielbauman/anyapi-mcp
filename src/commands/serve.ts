@@ -1,5 +1,5 @@
-// `anyapi-mcp serve` - stdio MCP server exposing three tools: `search`, `execute`,
-// and `add_api`.
+// `anyapi-mcp serve` - stdio MCP server exposing `search`, `execute`,
+// `authenticate`, `configure_oauth`, and `add_api`.
 //
 // The registry is re-read on each call (hot-reload), so an API registered mid-
 // session - via the add_api tool or the `anyapi-mcp add` CLI - is usable without a
@@ -11,13 +11,28 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { resolve } from "@std/path";
 import { z } from "zod";
-import { readRegistry, type RegistryEntry } from "../registry.ts";
+import {
+  type OAuth2Auth,
+  readRegistry,
+  type RegistryEntry,
+  updateEntry,
+} from "../registry.ts";
 import { isUrl } from "../openapi.ts";
 import { type OperationInfo, readOpsIndex } from "../operation.ts";
 import { getSecret } from "../keystore.ts";
 import { registerApi } from "../register.ts";
 import { getAdapter } from "../adapters.ts";
 import { runSandboxed } from "../execute/run.ts";
+import {
+  describeExpiry,
+  ensureAccessToken,
+  loadClient,
+  loadToken,
+  OAuthNeedsLoginError,
+  RESERVED_AUTHORIZE_PARAMS,
+  runAuthorizationCodeFlow,
+  saveToken,
+} from "../oauth.ts";
 
 const MAX_RESULTS = 25;
 
@@ -39,6 +54,24 @@ const EXECUTE_DESCRIPTION =
   "`error` is set (no throw) - narrow on `data` for success. console.log anything you want back. " +
   `Chain multiple calls in one execution: intermediate results stay in the sandbox ` +
   `instead of round-tripping through you. Input: { api: <registered id>, code: <typescript> }.`;
+
+const AUTHENTICATE_DESCRIPTION =
+  "Start the OAuth browser login for a registered OAuth API: opens the user's browser to the " +
+  "provider's consent page, captures the redirect locally, and stores the resulting tokens (which " +
+  "then auto-refresh). Call this when execute reports that an API needs authentication, or to " +
+  "recover after a session could not be refreshed. Requires that the user has already set up the " +
+  "OAuth app credentials once via `anyapi-mcp login` - this tool never accepts secrets. The call " +
+  "blocks until the user finishes in the browser (or it times out). Input: { api: <registered id> }.";
+
+const CONFIGURE_OAUTH_DESCRIPTION =
+  "Adjust the safe OAuth request parameters for a registered OAuth API to fix provider quirks you " +
+  "discover (e.g. a provider that wants comma-separated scopes, a narrower scope set, or an extra " +
+  "authorize-URL param like access_type=offline). Settable: `scopes` (full replacement set), " +
+  "`scopeSeparator`, and `extraAuthParams` (merged into the existing map; a key with an empty-string " +
+  "value removes it). For security this tool does NOT change the authorize/token endpoints - those " +
+  "carry the client secret and are CLI-only (`anyapi-mcp login --auth-url/--token-url`). Call with " +
+  "only { api } to read the current config. After changing scopes, call `authenticate` to mint a " +
+  "token with the new scopes. Input: { api, scopes?, scopeSeparator?, extraAuthParams? }.";
 
 const ADD_API_DESCRIPTION =
   "Register a new API so search/execute can use it. Pass an OpenAPI spec URL (kind " +
@@ -65,11 +98,23 @@ function buildInstructions(entries: RegistryEntry[]): string {
     "anyapi-mcp turns OpenAPI HTTP APIs into code you run. `search` finds operations; `execute` runs " +
     "TypeScript against a typed openapi-fetch `client` (chain several calls in one execute - " +
     "intermediate data stays in the sandbox, saving round-trips). `add_api` registers new APIs.";
+  const oauthNote =
+    "\n\nSome APIs use OAuth 2.0. If execute reports that one needs authentication, call the " +
+    "`authenticate` tool with its id to open a browser login for the user (or tell the user to run " +
+    "`anyapi-mcp login <id>`). Tokens then refresh automatically. If a login fails because of a " +
+    "provider quirk (wrong scopes, scope separator, or a missing authorize param), use " +
+    "`configure_oauth` to correct the safe request params, then authenticate again.";
   if (entries.length === 0) {
     return `${intro}\n\nNo APIs are registered yet.\n${howToAdd()}`;
   }
-  const ids = entries.map((e) => `${e.id} (${e.name})`).join(", ");
-  return `${intro}\n\nRegistered APIs: ${ids}.\nRegister more anytime with add_api or \`anyapi-mcp add\`.`;
+  const ids = entries
+    .map((e) =>
+      `${e.id} (${e.name})${e.auth.kind === "oauth2" ? " [OAuth]" : ""}`
+    )
+    .join(", ");
+  const hasOAuth = entries.some((e) => e.auth.kind === "oauth2");
+  return `${intro}${hasOAuth ? oauthNote : ""}\n\nRegistered APIs: ${ids}.\n` +
+    `Register more anytime with add_api or \`anyapi-mcp add\`.`;
 }
 
 // ---- registry state (hot-reloaded each call) ----
@@ -267,6 +312,17 @@ async function executeRequest(
         isError: true,
       };
     }
+  } else if (entry.auth.kind === "oauth2") {
+    // Refresh happens here in the parent (full network + keystore); the sandbox
+    // only ever receives the resulting access token.
+    try {
+      token = await ensureAccessToken(entry, entry.auth);
+    } catch (err) {
+      if (err instanceof OAuthNeedsLoginError) {
+        return { text: await oauthGuidance(entry, err.message), isError: true };
+      }
+      throw err;
+    }
   }
 
   const source = getAdapter(entry.kind).buildHarness(entry, code);
@@ -278,6 +334,201 @@ async function executeRequest(
   return {
     text: formatResult(stdout, stderr, exitCode),
     isError: exitCode !== 0,
+  };
+}
+
+// ---- oauth ----
+
+/**
+ * Guidance returned when an OAuth API needs (re-)authentication. Steers the agent
+ * to the `authenticate` tool when credentials already exist (re-auth can run
+ * without a human typing secrets), and to the CLI `login` otherwise.
+ */
+async function oauthGuidance(
+  entry: RegistryEntry,
+  reason: string,
+): Promise<string> {
+  if (entry.auth.kind !== "oauth2") return reason;
+  const hasClient = (await loadClient(entry.auth)) !== undefined;
+  if (hasClient) {
+    return `${reason}\n\n` +
+      `Credentials are already configured, so you can call the "authenticate" tool ` +
+      `with { api: "${entry.id}" } to open a browser login for the user. ` +
+      `Or the user can run \`anyapi-mcp login ${entry.id}\` in a shell.`;
+  }
+  return `${reason}\n\n` +
+    `This API uses OAuth and no app credentials are set up yet. Ask the user to:\n` +
+    `  1. create an OAuth app with the provider${
+      entry.docsUrl ? ` (${entry.docsUrl})` : ""
+    } and set its redirect URL to ${entry.auth.redirectUri}\n` +
+    `  2. run \`anyapi-mcp login ${entry.id} --client-id <id> --client-secret <secret>\`\n` +
+    `Secrets must go through that CLI, never this conversation. After that, ` +
+    `execute will work and the token will auto-refresh.`;
+}
+
+async function authenticateRequest(
+  entries: RegistryEntry[],
+  api: string,
+): Promise<{ text: string; isError: boolean }> {
+  const entry = entries.find((e) => e.id === api);
+  if (!entry) {
+    const known = entries.map((e) => e.id).join(", ") || "(none)";
+    return {
+      text: `Unknown api "${api}". Registered ids: ${known}`,
+      isError: true,
+    };
+  }
+  if (entry.auth.kind !== "oauth2") {
+    return {
+      text:
+        `"${api}" does not use OAuth (auth: ${entry.auth.kind}); nothing to authenticate.`,
+      isError: true,
+    };
+  }
+  const auth = entry.auth;
+  const client = await loadClient(auth);
+  if (!client) {
+    return {
+      text:
+        `Can't start OAuth for "${api}": no client credentials are stored. ` +
+        `The user must create an OAuth app and run ` +
+        `\`anyapi-mcp login ${api} --client-id <id> --client-secret <secret>\` once ` +
+        `(this tool never handles secrets).`,
+      isError: true,
+    };
+  }
+  try {
+    // Logs go to stderr (never stdout) to preserve the MCP frame stream.
+    const token = await runAuthorizationCodeFlow({
+      authorizationUrl: auth.authorizationUrl,
+      tokenUrl: auth.tokenUrl,
+      client,
+      scopes: auth.scopes,
+      scopeSeparator: auth.scopeSeparator,
+      redirectUri: auth.redirectUri,
+      extraAuthParams: auth.extraAuthParams,
+      onProgress: (m) => console.error(m),
+    });
+    await saveToken(auth, token);
+    return {
+      text: `Authenticated "${api}" (${describeExpiry(token)}). ` +
+        `The access token is stored and will auto-refresh. You can now call execute.`,
+      isError: false,
+    };
+  } catch (err) {
+    return {
+      text: `Authentication for "${api}" failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+      isError: true,
+    };
+  }
+}
+
+/** Read-only summary of an entry's OAuth config (endpoints shown but CLI-only). */
+async function reportOAuthConfig(
+  entry: RegistryEntry,
+  auth: OAuth2Auth,
+): Promise<string> {
+  const tokenStored = (await loadToken(auth)) !== undefined;
+  return [
+    `OAuth config for "${entry.id}":`,
+    `  scopes:          [${auth.scopes.join(", ")}]`,
+    `  scopeSeparator:  ${JSON.stringify(auth.scopeSeparator)}`,
+    `  extraAuthParams: ${JSON.stringify(auth.extraAuthParams ?? {})}`,
+    `  redirectUri:     ${auth.redirectUri}`,
+    `  authorizationUrl: ${auth.authorizationUrl}  (CLI-only)`,
+    `  tokenUrl:         ${auth.tokenUrl}  (CLI-only)`,
+    `  authenticated:   ${tokenStored ? "yes" : "no"}`,
+    "",
+    "Editable here: scopes, scopeSeparator, extraAuthParams. " +
+    "Change endpoints with `anyapi-mcp login --auth-url/--token-url`.",
+  ].join("\n");
+}
+
+interface ConfigureOAuthArgs {
+  api: string;
+  scopes?: string[];
+  scopeSeparator?: string;
+  extraAuthParams?: Record<string, string>;
+}
+
+async function configureOAuthRequest(
+  entries: RegistryEntry[],
+  args: ConfigureOAuthArgs,
+): Promise<{ text: string; isError: boolean }> {
+  const entry = entries.find((e) => e.id === args.api);
+  if (!entry) {
+    const known = entries.map((e) => e.id).join(", ") || "(none)";
+    return {
+      text: `Unknown api "${args.api}". Registered ids: ${known}`,
+      isError: true,
+    };
+  }
+  if (entry.auth.kind !== "oauth2") {
+    return {
+      text:
+        `"${args.api}" does not use OAuth (auth: ${entry.auth.kind}); nothing to configure.`,
+      isError: true,
+    };
+  }
+  const auth = entry.auth;
+
+  const changes: string[] = [];
+
+  if (args.extraAuthParams !== undefined) {
+    const reserved = Object.keys(args.extraAuthParams).filter((k) =>
+      RESERVED_AUTHORIZE_PARAMS.has(k)
+    );
+    if (reserved.length) {
+      return {
+        text:
+          `Refusing to set reserved authorize params: ${
+            reserved.join(", ")
+          }. ` +
+          `These are managed by anyapi-mcp; the authorize/token endpoints can only ` +
+          `be changed via \`anyapi-mcp login --auth-url/--token-url\`.`,
+        isError: true,
+      };
+    }
+    // Merge into the existing map; an empty-string value removes a key.
+    const next: Record<string, string> = { ...(auth.extraAuthParams ?? {}) };
+    for (const [k, v] of Object.entries(args.extraAuthParams)) {
+      if (v === "") delete next[k];
+      else next[k] = v;
+    }
+    if (Object.keys(next).length) auth.extraAuthParams = next;
+    else delete auth.extraAuthParams;
+    changes.push(
+      `extraAuthParams = ${JSON.stringify(auth.extraAuthParams ?? {})}`,
+    );
+  }
+
+  if (args.scopeSeparator !== undefined) {
+    auth.scopeSeparator = args.scopeSeparator;
+    changes.push(`scopeSeparator = ${JSON.stringify(args.scopeSeparator)}`);
+  }
+
+  let scopesChanged = false;
+  if (args.scopes !== undefined) {
+    auth.scopes = args.scopes;
+    scopesChanged = true;
+    changes.push(`scopes = [${args.scopes.join(", ")}]`);
+  }
+
+  if (changes.length === 0) {
+    return { text: await reportOAuthConfig(entry, auth), isError: false };
+  }
+
+  await updateEntry(entry);
+  const followUp = scopesChanged
+    ? ` Scopes changed - call the authenticate tool for "${args.api}" to mint a token with the new scopes.`
+    : ` Takes effect at the next login; call authenticate if a fresh consent is needed.`;
+  return {
+    text: `Updated OAuth config for "${args.api}":\n  ${
+      changes.join("\n  ")
+    }\n${followUp}`,
+    isError: false,
   };
 }
 
@@ -343,6 +594,52 @@ export async function runServe(_args: string[]): Promise<void> {
     },
   );
 
+  const authenticateShape = { api: z.string() };
+  type AuthenticateArgs = z.infer<z.ZodObject<typeof authenticateShape>>;
+  server.registerTool(
+    "authenticate",
+    {
+      title: "Authenticate an OAuth API",
+      description: AUTHENTICATE_DESCRIPTION,
+      inputSchema: authenticateShape,
+    },
+    async ({ api }: AuthenticateArgs) => {
+      const { entries } = await loadState();
+      const { text, isError } = await authenticateRequest(entries, api);
+      return { content: [{ type: "text" as const, text }], isError };
+    },
+  );
+
+  const configureOAuthShape = {
+    api: z.string().describe("Registered OAuth API id"),
+    scopes: z.array(z.string()).optional().describe(
+      "Full replacement set of scopes to request at the next login",
+    ),
+    scopeSeparator: z.string().optional().describe(
+      'Scope separator in the authorize URL (" " for RFC 6749, "," for Strava)',
+    ),
+    extraAuthParams: z.record(z.string(), z.string()).optional().describe(
+      "Extra authorize-URL params, merged in; an empty-string value removes a key. " +
+        "Reserved params (client_id, redirect_uri, response_type, scope, state) are rejected.",
+    ),
+  };
+  type ConfigureOAuthToolArgs = z.infer<
+    z.ZodObject<typeof configureOAuthShape>
+  >;
+  server.registerTool(
+    "configure_oauth",
+    {
+      title: "Configure OAuth request parameters",
+      description: CONFIGURE_OAUTH_DESCRIPTION,
+      inputSchema: configureOAuthShape,
+    },
+    async (args: ConfigureOAuthToolArgs) => {
+      const { entries } = await loadState();
+      const { text, isError } = await configureOAuthRequest(entries, args);
+      return { content: [{ type: "text" as const, text }], isError };
+    },
+  );
+
   const addApiShape = {
     specUrl: z.string().describe(
       'OpenAPI spec URL (or path); a GraphQL endpoint URL for kind "graphql"; a WSDL URL for kind "soap"',
@@ -385,13 +682,19 @@ export async function runServe(_args: string[]): Promise<void> {
         const kindFlag = entry.kind === "openapi"
           ? ""
           : ` --kind ${entry.kind}`;
-        const text =
+        const head =
           `Registered "${entry.id}" (${entry.name}): ${operationCount} operations, ` +
-          `base ${entry.baseUrl}. Available now - call search with api "${entry.id}", then execute. ` +
-          `If requests come back 401/403 this API needs a token: run ` +
-          `\`anyapi-mcp add ${specSource} --id ${entry.id} --token${kindFlag}\` in a shell so the token ` +
-          `is stored in your OS keychain (never through this chat).`;
-        return { content: [{ type: "text" as const, text }] };
+          `base ${entry.baseUrl}. Available now - call search with api "${entry.id}", then execute.`;
+        const authHelp = entry.auth.kind === "oauth2"
+          ? ` This API uses OAuth 2.0. The user must create an OAuth app (redirect ` +
+            `URL ${entry.auth.redirectUri}) and run \`anyapi-mcp login ${entry.id} ` +
+            `--client-id <id> --client-secret <secret>\` in a shell (secrets never go ` +
+            `through this chat). After that, execute works and you can call the ` +
+            `authenticate tool to re-login if a session expires.`
+          : ` If requests come back 401/403 this API needs a token: run ` +
+            `\`anyapi-mcp add ${specSource} --id ${entry.id} --token${kindFlag}\` in a shell so the token ` +
+            `is stored in your OS keychain (never through this chat).`;
+        return { content: [{ type: "text" as const, text: head + authHelp }] };
       } catch (err) {
         return {
           content: [{

@@ -9,6 +9,7 @@
 
 import type { ApiKind, RegistryEntry } from "./registry.ts";
 import type { OperationInfo } from "./operation.ts";
+import type { DiscoveredOAuth } from "./oauth.ts";
 
 export interface PrepareOptions {
   /** Override the base URL the adapter would otherwise derive. */
@@ -23,6 +24,8 @@ export interface PreparedApi {
   baseUrl: string;
   hosts: string[];
   operations: OperationInfo[];
+  /** OAuth2 authorization-code config discovered from the source, if any. */
+  oauth?: DiscoveredOAuth;
   /** Write the generated client types to `typesPath` (path chosen by the caller). */
   writeTypes(typesPath: string): Promise<void>;
 }

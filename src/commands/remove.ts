@@ -4,6 +4,7 @@
 import { parseArgs } from "@std/cli/parse-args";
 import { findEntry, removeEntry } from "../registry.ts";
 import { deleteSecret } from "../keystore.ts";
+import { clearOAuthSecrets } from "../oauth.ts";
 import { opsPathFor } from "../paths.ts";
 
 export async function runRemove(args: string[]): Promise<void> {
@@ -33,6 +34,15 @@ export async function runRemove(args: string[]): Promise<void> {
       removed
         ? `Deleted token ${entry.auth.tokenKey}.`
         : `No stored token found for ${entry.auth.tokenKey}.`,
+    );
+  } else if (entry.auth.kind === "oauth2") {
+    const { token, client } = await clearOAuthSecrets(entry.auth, {
+      forgetClient: true,
+    });
+    console.error(
+      `Deleted OAuth secrets (token: ${token ? "yes" : "none"}, client: ${
+        client ? "yes" : "none"
+      }).`,
     );
   }
 

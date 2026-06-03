@@ -87,7 +87,15 @@ client, and writes a registry entry.
 | `--base-url <url>`                | Override the base URL derived from the spec's `servers[]`.                                              |
 | `--docs <url>`                    | Documentation URL to store and surface (not parsed).                                                    |
 | `--token`                         | Store a bearer token. Read without echo from a TTY, or piped via stdin.                                 |
-| `--no-auth`                       | Register without authentication (the default).                                                          |
+| `--oauth`                         | Treat the API as OAuth 2.0 even if the spec doesn't declare it.                                         |
+| `--auth-url` / `--token-url`      | OAuth authorize / token endpoints (override the spec's values).                                         |
+| `--scope <name>`                  | Scope to request at login (repeatable; default: the spec's scopes).                                     |
+| `--scope-separator <sep>`         | Scope separator in the authorize URL (default `" "`; Strava uses `","`).                                |
+| `--no-auth`                       | Register without authentication.                                                                        |
+
+OpenAPI specs that declare an **OAuth 2.0 authorization-code flow are detected
+automatically**: the API is registered as `oauth2`, and you run
+[`login`](#login-id-options) once to authenticate (see [OAuth](#oauth-apis)).
 
 ```sh
 # bearer auth, prompted without echo:
@@ -99,6 +107,9 @@ echo "$GITHUB_TOKEN" | anyapi-mcp add <spec-url> --token
 # no auth - id defaults to the reverse-DNS base URL (here: io.swagger.petstore3.api.v3):
 anyapi-mcp add https://petstore3.swagger.io/api/v3/openapi.json
 
+# OAuth is auto-detected from the spec; just add, then `login`:
+anyapi-mcp add https://developers.strava.com/swagger/swagger.json --id com.strava.api
+
 # graphql - introspect an endpoint (id: com.trevorblades.countries):
 anyapi-mcp add https://countries.trevorblades.com/ --kind graphql
 
@@ -109,11 +120,38 @@ anyapi-mcp add "http://www.dneonline.com/calculator.asmx?WSDL" --kind soap
 ### `list`
 
 Lists registered APIs with id, name, base URL, operation count, and auth kind.
+For OAuth APIs it also shows live login status and token expiry (e.g.
+`oauth2 (logged in, expires in 5h)` or `oauth2 (not logged in)`).
+
+### `login <id> [options]`
+
+Authenticates an OAuth 2.0 API in the browser (see [OAuth](#oauth-apis)). Stores
+the OAuth app credentials in the keystore (the client secret is read without
+echo, like `add --token`), opens the provider's consent page, captures the
+redirect on a local one-shot callback server, and saves the resulting tokens
+(which then refresh automatically). Re-running it re-authenticates.
+
+| Option                       | Description                                                                 |
+| ---------------------------- | --------------------------------------------------------------------------- |
+| `--client-id <id>`           | OAuth app client id (required on first login).                              |
+| `--client-secret <s>`        | Client secret (omit to be prompted without echo; or pipe via stdin).        |
+| `--scope <name>`             | Scope to request (repeatable; default: the API's configured scopes).        |
+| `--scope-separator <sep>`    | Scope separator in the authorize URL (default `" "`; Strava uses `","`).    |
+| `--redirect-uri <url>`       | Local callback URL to listen on (default `http://localhost:9876/callback`). |
+| `--port <n>`                 | Shortcut to set the callback port (host `localhost`, path `/callback`).     |
+| `--auth-url` / `--token-url` | Override the stored authorize / token endpoint.                             |
+| `--no-browser`               | Print the authorize URL instead of opening a browser (headless/SSH).        |
+
+### `logout <id> [--forget-client]`
+
+Removes the stored OAuth tokens for an API (it stays registered). By default the
+OAuth app credentials are kept so the next `login` needs no flags;
+`--forget-client` removes those too.
 
 ### `remove <id>`
 
-Removes the registry entry, deletes the stored token from the keystore, and
-cleans up cached files.
+Removes the registry entry, deletes stored secrets from the keystore (bearer
+token, or OAuth client credentials + tokens), and cleans up cached files.
 
 ### `serve`
 
@@ -123,15 +161,71 @@ registered APIs are picked up without a restart) and exposes:
 - **`search`** - `{ query, api? }` → compact operation matches (`api`, `method`,
   `path`, `operationId`, `summary`, `params`, `requestBodyHint`).
 - **`execute`** - `{ api, code }` → runs `code` against a typed `client` and
-  returns `{ stdout, stderr, exitCode }` verbatim.
+  returns `{ stdout, stderr, exitCode }` verbatim. For OAuth APIs the access
+  token is refreshed automatically first; if the API isn't authenticated, the
+  result explains how to fix it (call `authenticate`, or run
+  `anyapi-mcp login`).
+- **`authenticate`** - `{ api }` → opens the user's browser to (re-)authenticate
+  an OAuth API and stores the tokens. Lets the model recover from an expired or
+  revoked session without leaving the chat. It never accepts secrets — the user
+  must have run `anyapi-mcp login` once to set up the OAuth app credentials.
+- **`configure_oauth`** - `{ api, scopes?, scopeSeparator?, extraAuthParams? }`
+  → lets the model fix OAuth provider quirks it discovers (wrong scope set,
+  comma-vs-space separator, an extra authorize param like
+  `access_type=offline`). It only touches **safe** request params — never the
+  authorize/token endpoints (those carry the client secret and stay CLI-only),
+  and reserved params like `redirect_uri`/`client_id` are rejected. Call with
+  just `{ api }` to read the current config.
 - **`add_api`** - `{ specUrl, kind?, id?, name?, baseUrl?, docsUrl? }` →
-  registers a new API (`kind` `openapi`, `graphql`, or `soap`, no-auth) so the
-  model can self-serve public APIs. Tokens are **not** accepted here; for
-  authenticated APIs use `anyapi-mcp add … --token` so the secret goes to the OS
-  keychain, not the conversation.
+  registers a new API (`kind` `openapi`, `graphql`, or `soap`) so the model can
+  self-serve public APIs. Secrets are **not** accepted here; for authenticated
+  APIs use `anyapi-mcp add … --token` (bearer) or `anyapi-mcp login` (OAuth) so
+  the secret goes to the OS keychain, not the conversation.
 
 The server also sends MCP `instructions` at connect time describing the
 workflow, and - when the registry is empty - exactly how to register an API.
+
+### OAuth APIs
+
+Many user-facing APIs (Strava, Google, GitHub, …) use **OAuth 2.0**. anyapi-mcp
+supports the authorization-code flow end to end:
+
+1. **Add the API.** OpenAPI specs that declare an authorization-code flow are
+   detected automatically (`anyapi-mcp add <spec>` registers it as `oauth2`).
+   For sources that don't declare one, pass
+   `--oauth --auth-url … --token-url …`.
+2. **Create an OAuth app** with the provider and set its redirect/callback URL
+   to the one `add`/`login` prints (default `http://localhost:9876/callback`).
+   You get a **client id** and **client secret**.
+3. **Log in once:**
+   ```sh
+   anyapi-mcp login com.strava.api --client-id <id> --client-secret <secret> \
+     --scope read --scope activity:read_all
+   ```
+   This opens your browser, you approve, and the tokens are stored in the OS
+   keychain. The access token then **refreshes automatically** before each
+   `execute` — you don't log in again until you revoke access.
+
+From then on the model just calls `search`/`execute` as usual. If a session
+can't be refreshed (e.g. you revoked the app), the model can call the
+`authenticate` tool to re-open the browser login — no secrets pass through the
+conversation, since the client credentials are already in the keychain.
+
+A small built-in quirks table fixes well-known providers whose specs are wrong
+or non-standard — e.g. Strava's spec lists `/api/v3/oauth/*` (the live endpoints
+are `/oauth/*`) and Strava wants comma-separated scopes. For anything else, the
+**registry entry is the override** (it's what every refresh reads):
+`anyapi-mcp login --auth-url/--token-url/--scope-separator/--scope` writes the
+corrected values onto it. The model can also fix the **safe** params it
+discovers (scopes, scope separator, extra authorize params) with the
+`configure_oauth` tool — but the authorize/token endpoints are CLI-only, since
+`tokenUrl` is where the client secret is POSTed and shouldn't be agent-writable.
+
+Notes & limits: only the **authorization-code** grant is supported (no PKCE,
+implicit, client-credentials, or password grants). Built-in quirks seed defaults
+at `add` time only, so a quirk discovered later won't retroactively rewrite an
+already-registered API — re-`add`, `login --auth-url …`, or `configure_oauth`
+(safe params) to apply it.
 
 ### `install`
 
@@ -202,8 +296,11 @@ and runs it in a `deno` subprocess scoped with:
 - a 30-second timeout.
 
 The token is injected into the subprocess environment only; the model never sees
-it, and the net allowlist means it can't be exfiltrated. **Type-checking stays
-on** (`--check`) so the model sees type errors and can self-correct - calling an
+it, and the net allowlist means it can't be exfiltrated. For OAuth APIs the
+parent process refreshes the access token (in the keychain) **before** building
+the harness, so the sandbox only ever receives a currently-valid token and never
+touches the refresh token or token endpoint. **Type-checking stays on**
+(`--check`) so the model sees type errors and can self-correct - calling an
 operation with the wrong arguments returns the exact expected shape.
 
 Writing code with `openapi-fetch`: `response` is always present, so check
@@ -224,7 +321,10 @@ builds the envelope and parses the response for you.
 ## Design notes & limits
 
 - **Secrets** live in the OS keystore (service `anyapi-mcp`), never in the
-  registry. The registry only records the keystore account name (`tokenKey`).
+  registry. The registry only records keystore account names (`tokenKey`; for
+  OAuth also `clientKey`). OAuth refresh and the browser login run in the parent
+  process — the execute sandbox only ever receives a ready access token, never
+  the client secret or refresh token.
 - **Files**: registry at `$XDG_CONFIG_HOME/anyapi-mcp/apis.jsonl` (default
   `~/.config/anyapi-mcp`); generated `.d.ts` and operation indexes at
   `$XDG_CACHE_HOME/anyapi-mcp` (default `~/.cache/anyapi-mcp`).
@@ -246,10 +346,12 @@ builds the envelope and parses the response for you.
   service. Not covered: rpc/encoded, WS-Security / SOAP headers, MTOM, external
   XSD imports, WSDL 2.0.
 - **v1 scope**: OpenAPI specs in JSON or YAML - OpenAPI 3.x, or Swagger 2.0
-  auto-converted to 3.0 - plus GraphQL endpoints and SOAP/WSDL services; bearer
-  / no auth. `search` is keyword-based over the operation index - no embeddings
-  or freeform-doc search. Each `execute` is a fresh subprocess (no persistent
-  state between calls).
+  auto-converted to 3.0 - plus GraphQL endpoints and SOAP/WSDL services; **no /
+  bearer / OAuth 2.0 authorization-code** auth (no PKCE, implicit,
+  client-credentials, or password grants). `search` is keyword-based over the
+  operation index - no embeddings or freeform-doc search. Each `execute` is a
+  fresh subprocess (no persistent state between calls); OAuth tokens persist in
+  the keychain and refresh automatically.
 
 ## Development
 

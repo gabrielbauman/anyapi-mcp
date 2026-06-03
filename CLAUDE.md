@@ -7,7 +7,7 @@ drives by writing code. See [README.md](README.md) for the user-facing pitch.
 ## Commands
 
 ```sh
-deno task dev <subcommand>   # run from source (add | list | remove | serve)
+deno task dev <subcommand>   # run from source (add | list | login | logout | remove | serve | install)
 deno task compile            # build the self-contained ./anyapi-mcp binary
 deno task check              # type-check (deno check src/main.ts)
 deno task lint               # deno lint src/
@@ -22,21 +22,32 @@ There is no test suite yet.
 The core (registry, search, execute sandbox) is **protocol-agnostic**; each
 protocol plugs in through one in-tree adapter object.
 
-- `src/main.ts`: argv dispatch to the four subcommands.
-- `src/commands/{add,install,list,remove,serve}.ts`: one file per subcommand.
-  `serve.ts` is the MCP server exposing `search`, `execute`, `add_api`;
-  `install.ts` registers anyapi-mcp with Claude Code / Desktop.
+- `src/main.ts`: argv dispatch to the subcommands.
+- `src/commands/{add,install,list,login,logout,remove,serve}.ts`: one file per
+  subcommand. `serve.ts` is the MCP server exposing `search`, `execute`,
+  `authenticate`, `configure_oauth`, `add_api`; `install.ts` registers
+  anyapi-mcp with Claude Code / Desktop; `login`/`logout` manage OAuth sessions.
 - `src/adapter.ts`: the `ProtocolAdapter` seam. `prepare()` turns a source into
-  base URL + hosts + operation index + generated client types; `buildHarness()`
-  builds the `execute` preamble that puts a typed `client` in scope.
+  base URL + hosts + operation index + generated client types (+ optional
+  discovered OAuth config); `buildHarness()` builds the `execute` preamble that
+  puts a typed `client` in scope.
 - `src/adapters.ts`: discriminated-union registry keyed by `kind`. **Adding a
   protocol means a new entry here plus an adapter file, not a plugin system.**
 - `src/openapi.ts` / `src/graphql.ts` / `src/soap.ts`: the three adapters.
+  OpenAPI also does OAuth2 discovery (`discoverOAuth`).
+- `src/oauth.ts`: protocol-agnostic OAuth 2.0 authorization-code support — the
+  browser login flow (local one-shot callback server), token storage in the
+  keystore, automatic refresh (`ensureAccessToken`), and a small known-provider
+  quirks table (e.g. Strava's real endpoints + comma scope separator).
 - `src/registry.ts`: the `apis.jsonl` registry (one `RegistryEntry` per line).
-- `src/register.ts`: registration logic shared by `add` and `add_api`.
+  `Auth` is a union: `none` | `bearer` | `oauth2`.
+- `src/register.ts`: registration logic shared by `add` and `add_api`; resolves
+  the OAuth config (precedence: explicit flag > quirk > discovered).
 - `src/operation.ts`: operation index + keyword `search` (no embeddings).
 - `src/keystore.ts`: OS keychain access (`security` on macOS, `secret-tool` on
-  Linux). Service name is `anyapi-mcp`; accounts look like `anyapi-mcp:<id>`.
+  Linux). Service name is `anyapi-mcp`; accounts look like `anyapi-mcp:<id>`
+  (bearer), `anyapi-mcp:<id>:client` / `anyapi-mcp:<id>:oauth` (OAuth client
+  creds + token bundle, each a JSON blob).
 - `src/paths.ts`: XDG dirs. Registry under `~/.config/anyapi-mcp`, generated
   types under `~/.cache/anyapi-mcp`.
 - `src/execute/run.ts`: the sandboxed subprocess runner.
@@ -50,9 +61,25 @@ protocol plugs in through one in-tree adapter object.
   `--allow-net=<registered API hosts only>`, `--allow-env=ANYAPI_MCP_TOKEN`, no
   read/write/run, and a 30s timeout. Type-checking stays **on** (`--check`) so
   the model sees type errors. Don't widen these grants.
-- **Secrets** live only in the OS keystore. The registry stores the keystore
-  account (`tokenKey`), never the token. `add_api` (the MCP tool) must not
-  accept tokens; those go through the `anyapi-mcp add ... --token` CLI.
+- **Secrets** live only in the OS keystore. The registry stores keystore account
+  names (`tokenKey`; for OAuth also `clientKey`), never the secret itself. No
+  MCP tool may accept secrets: bearer tokens go through
+  `anyapi-mcp add --token`, and OAuth client credentials go through
+  `anyapi-mcp login` (`--client-id` / `--client-secret`). The agent-facing
+  `authenticate` tool only (re-)runs the browser flow with credentials the user
+  already stored.
+- **Agents may set only the _safe_ OAuth params.** `configure_oauth` (and the
+  `login`/`add` CLI) can change `scopes`/`scopeSeparator`/`extraAuthParams`, but
+  the `authorizationUrl`/`tokenUrl` endpoints are CLI-only: `tokenUrl` is where
+  the client secret is POSTed, so an agent-writable endpoint would be an
+  exfiltration vector. `buildAuthorizeUrl` and `configure_oauth` both reject
+  `RESERVED_AUTHORIZE_PARAMS` (`client_id`, `redirect_uri`, `response_type`,
+  `scope`, `state`) in `extraAuthParams`.
+- **OAuth lives in the parent, never the sandbox.** Token refresh and the login
+  flow run in the serve/CLI process (full net + keystore). The execute sandbox
+  only ever receives a ready access token via `ANYAPI_MCP_TOKEN`; it never sees
+  the client secret or refresh token and never calls the token endpoint. Refresh
+  happens in `executeRequest` (via `ensureAccessToken`) before the harness runs.
 - `serve` re-reads the registry on each call, so a mid-session `add_api`/`add`
   is usable without restart. Keep it stateless across calls.
 - Strict TS is on (`noUnusedLocals`, `noUnusedParameters`, `noImplicitOverride`,
@@ -62,5 +89,8 @@ protocol plugs in through one in-tree adapter object.
 
 OpenAPI specs in JSON or YAML — OpenAPI 3.x, or Swagger 2.0 auto-converted to
 3.0 via swagger2openapi — GraphQL endpoints, SOAP/WSDL (WSDL 1.1,
-document/literal). Bearer or no auth. Each `execute` is a fresh subprocess with
-no persisted state.
+document/literal). Auth: none, bearer, or OAuth 2.0 **authorization-code** (the
+only OAuth flow; auto-discovered from OpenAPI security schemes, or set manually
+with `--oauth`/`--auth-url`/`--token-url`). No PKCE, no implicit/client-creds/
+password grants yet. Each `execute` is a fresh subprocess with no persisted
+state; OAuth tokens persist in the keystore and refresh automatically.
