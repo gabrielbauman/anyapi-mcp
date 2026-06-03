@@ -129,6 +129,21 @@ Lists registered APIs with id, name, base URL, operation count, and auth kind.
 For OAuth APIs it also shows live login status and token expiry (e.g.
 `oauth2 (logged in, expires in 5h)` or `oauth2 (not logged in)`).
 
+### `regenerate [id ...]`
+
+Rebuilds the generated client code (typed `.d.ts`/client module + operation
+index) for registered APIs by re-fetching each one's saved source. With no id it
+does all of them; pass ids to target specific APIs, or `--stale-only` to rebuild
+just those whose code predates the current build.
+
+This only refreshes generated code: **saved credentials and OAuth config are
+left untouched** (bearer tokens, OAuth client credentials, and login state all
+survive; baseUrl and the host allowlist are preserved too). Run it after
+upgrading `anyapi-mcp` so cached code matches the new generators - though
+`serve` also does this automatically (see below), so you rarely need to run it
+by hand. Each API is independent: if one source can't be re-fetched, the rest
+still regenerate and that API keeps its existing (working) code.
+
 ### `login <id> [options]`
 
 Authenticates an OAuth 2.0 API in the browser (see [OAuth](#oauth-apis)). Stores
@@ -162,7 +177,11 @@ token, or OAuth client credentials + tokens), and cleans up cached files.
 ### `serve`
 
 Runs the stdio MCP server. It re-reads the registry on each call (so newly
-registered APIs are picked up without a restart) and exposes:
+registered APIs are picked up without a restart). On startup, if the build's
+codegen version has changed since an API's code was generated (i.e. you upgraded
+`anyapi-mcp`), it regenerates that API's code first - the same work as
+`regenerate`, limited to stale entries, with credentials preserved and any
+re-fetch failure logged but non-fatal. It exposes:
 
 - **`search`** - `{ query, api? }` → compact operation matches (`api`, `method`,
   `path`, `operationId`, `summary`, `params`, `requestBodyHint`). Each param

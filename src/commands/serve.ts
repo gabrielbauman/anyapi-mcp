@@ -20,7 +20,12 @@ import {
 import { isUrl } from "../openapi.ts";
 import { type OperationInfo, readOpsIndex } from "../operation.ts";
 import { getSecret } from "../keystore.ts";
-import { registerApi, unregisterApi } from "../register.ts";
+import {
+  CODEGEN_VERSION,
+  regenerateApis,
+  registerApi,
+  unregisterApi,
+} from "../register.ts";
 import { getAdapter } from "../adapters.ts";
 import { runSandboxed } from "../execute/run.ts";
 import {
@@ -633,6 +638,38 @@ export async function runServe(_args: string[]): Promise<void> {
         ? `: ${startup.entries.map((e) => e.id).join(", ")}`
         : " (use the add_api tool or `anyapi-mcp add` to register one)"),
   );
+
+  // After an anyapi-mcp upgrade the cached client code may predate the current
+  // generators. Rebuild any entry whose codegenVersion is older before serving
+  // (one source re-fetch per stale API). Resilient: a failure logs and keeps the
+  // old, still-working code. All output stays on stderr - stdout is the MCP
+  // frame stream. The bumped addedAt makes the tools reload the fresh ops index.
+  const stale = startup.entries.filter(
+    (e) => e.codegenVersion !== CODEGEN_VERSION,
+  );
+  if (stale.length > 0) {
+    console.error(
+      `anyapi-mcp serve: codegen version changed; regenerating ${stale.length} ` +
+        `API(s) (${stale.map((e) => e.id).join(", ")}) ...`,
+    );
+    const results = await regenerateApis({
+      ids: stale.map((e) => e.id),
+      onProgress: (m) => console.error(m),
+    });
+    for (const r of results) {
+      if (!r.ok) {
+        console.error(
+          `anyapi-mcp serve: regeneration failed for ${r.id}: ${r.error} ` +
+            `(keeping existing code).`,
+        );
+      }
+    }
+    console.error(
+      `anyapi-mcp serve: regenerated ${
+        results.filter((r) => r.ok).length
+      }/${stale.length} API(s).`,
+    );
+  }
 
   const server = new McpServer(
     { name: "anyapi-mcp", version: "0.1.0" },
