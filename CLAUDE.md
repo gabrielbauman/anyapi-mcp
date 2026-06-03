@@ -12,10 +12,13 @@ deno task compile            # build the self-contained ./anyapi-mcp binary
 deno task check              # type-check (deno check src/main.ts)
 deno task lint               # deno lint src/
 deno task fmt                # deno fmt --check
+deno task test               # deno test -A src/
 ```
 
 Run `deno task check && deno task lint && deno task fmt` before committing.
-There is no test suite yet.
+Tests are sparse — only `*_test.ts` files alongside the code they cover (e.g.
+`src/openapi-sanitize_test.ts`); add one when logic is tricky enough to warrant
+it.
 
 ## Architecture
 
@@ -39,6 +42,21 @@ protocol plugs in through one in-tree adapter object.
   from document-, path-, or operation-level `servers` (`resolveBaseUrl`),
   failing loudly if the result lands on a raw spec-hosting host (e.g.
   raw.githubusercontent.com) rather than silently registering a broken base.
+  After `openapi-typescript` writes the `.d.ts`, OpenAPI post-processes it
+  through `src/openapi-sanitize.ts` (see below).
+- `src/openapi-sanitize.ts`: post-processes openapi-typescript output so a
+  recursive "arbitrary JSON" schema (or a `$ref` cycle) can't fail the
+  whole-program type check `execute` runs. openapi-typescript references schemas
+  by indexed access (`components["schemas"]["X"]`); when such a reference closes
+  a cycle in an _eager_ position (a union/array member, not behind an object
+  property/index signature) TypeScript rejects the entire file with `TS2502`,
+  blocking checked `execute` for every operation in the API. The sanitizer lifts
+  each schema in such a cycle into a top-level recursive `type` alias and points
+  the cyclic references at the alias names; the member declaration stays, so
+  external references still resolve. Detection counts only eager references, so
+  the common case (schemas that reference each other through properties) is left
+  byte-for-byte unchanged. Type safety is fully preserved — this fixes the check
+  without resorting to `check:false`.
 - `src/oauth.ts`: protocol-agnostic OAuth 2.0 authorization-code support — the
   browser login flow (local one-shot callback server), token storage in the
   keystore, automatic refresh (`ensureAccessToken`), and a small known-provider
