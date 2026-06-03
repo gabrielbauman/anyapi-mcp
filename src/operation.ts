@@ -37,14 +37,34 @@ export function clampDescription(
     : t;
 }
 
-/** Cap an enum list, appending a count sentinel (not a real value) when truncated. */
-export function clampEnum(values: string[]): string[] | undefined {
+/** Cap an enum list to a sane size, reporting how many real values were dropped. */
+function clampEnum(
+  values: string[],
+): { values: string[]; truncated: number } | undefined {
   if (values.length === 0) return undefined;
-  if (values.length <= MAX_ENUM_VALUES) return values;
-  return [
-    ...values.slice(0, MAX_ENUM_VALUES),
-    `… (${values.length - MAX_ENUM_VALUES} more; see generated types)`,
-  ];
+  if (values.length <= MAX_ENUM_VALUES) return { values, truncated: 0 };
+  return {
+    values: values.slice(0, MAX_ENUM_VALUES),
+    truncated: values.length - MAX_ENUM_VALUES,
+  };
+}
+
+/**
+ * Attach a param's allowed values, keeping `enum` to real values only. When the
+ * list is capped, the dropped count is noted in `description` (prose) rather than
+ * polluting `enum` with a non-value sentinel a caller might select and send.
+ */
+export function applyEnum(param: OperationParam, values: string[]): void {
+  const clamped = clampEnum(values);
+  if (!clamped) return;
+  param.enum = clamped.values;
+  if (clamped.truncated > 0) {
+    const note =
+      `(+${clamped.truncated} more allowed values; see generated types)`;
+    param.description = param.description
+      ? `${param.description} ${note}`
+      : note;
+  }
 }
 
 export interface OperationInfo {

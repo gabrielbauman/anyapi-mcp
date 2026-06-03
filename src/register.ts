@@ -260,7 +260,11 @@ export async function registerApi(
     // that the new entry no longer references.
     await cleanupOrphanedSecrets(existing.auth, entry.auth);
     if (existing.typesPath !== entry.typesPath) {
-      await Deno.remove(existing.typesPath).catch(() => {});
+      try {
+        await Deno.remove(existing.typesPath);
+      } catch (err) {
+        if (!(err instanceof Deno.errors.NotFound)) throw err;
+      }
     }
     if (!(await updateEntry(entry))) await appendEntry(entry);
   } else {

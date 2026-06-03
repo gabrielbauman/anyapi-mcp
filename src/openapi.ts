@@ -15,7 +15,7 @@ import { parse as parseYaml } from "@std/yaml";
 import { toFileUrl } from "@std/path";
 import { ensureCacheDir } from "./paths.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
-import { clampDescription, clampEnum } from "./operation.ts";
+import { applyEnum, clampDescription } from "./operation.ts";
 import type { OperationInfo, OperationParam } from "./operation.ts";
 import type { RegistryEntry } from "./registry.ts";
 import type { DiscoveredOAuth } from "./oauth.ts";
@@ -245,10 +245,7 @@ function buildParams(root: Json, rawParams: unknown[]): OperationParam[] {
     const description = clampDescription(str(p.description));
     if (description) param.description = description;
     const values = schemaEnum(root, p.schema);
-    if (values) {
-      const clamped = clampEnum(values);
-      if (clamped) param.enum = clamped;
-    }
+    if (values) applyEnum(param, values);
     params.push(param);
   }
   return params;

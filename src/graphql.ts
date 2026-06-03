@@ -5,7 +5,7 @@
 import { toFileUrl } from "@std/path";
 import { ensureCacheDir } from "./paths.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
-import { clampDescription, clampEnum } from "./operation.ts";
+import { applyEnum, clampDescription } from "./operation.ts";
 import type { OperationInfo, OperationParam } from "./operation.ts";
 import type { RegistryEntry } from "./registry.ts";
 
@@ -133,10 +133,7 @@ function buildParams(
     if (description) param.description = description;
     const named = namedTypeName(a.type);
     const values = named ? enumsByType.get(named) : undefined;
-    if (values) {
-      const clamped = clampEnum(values);
-      if (clamped) param.enum = clamped;
-    }
+    if (values) applyEnum(param, values);
     return param;
   });
 }

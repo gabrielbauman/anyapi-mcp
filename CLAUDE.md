@@ -53,7 +53,8 @@ protocol plugs in through one in-tree adapter object.
   the entry, its secrets, and its cached artifacts.
 - `src/operation.ts`: operation index + keyword `search` (no embeddings). Params
   carry optional `description`/`enum`, surfaced in search (`clampDescription`/
-  `clampEnum` bound their size).
+  `applyEnum` bound their size; `enum` holds only real values — an over-cap
+  count is noted in `description`, never as a fake enum entry).
 - `src/keystore.ts`: OS keychain access (`security` on macOS, `secret-tool` on
   Linux). Service name is `anyapi-mcp`; accounts look like `anyapi-mcp:<id>`
   (bearer), `anyapi-mcp:<id>:client` / `anyapi-mcp:<id>:oauth` (OAuth client
