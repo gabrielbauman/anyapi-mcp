@@ -102,15 +102,35 @@ export async function appendEntry(entry: RegistryEntry): Promise<void> {
   });
 }
 
+/**
+ * Atomically rewrite the whole registry: write a temp file in the same directory
+ * and rename it over the target, so an interrupted write can't truncate or
+ * corrupt the registry (rename is atomic within a filesystem).
+ */
+async function writeRegistry(entries: RegistryEntry[]): Promise<void> {
+  const dir = await ensureConfigDir();
+  const body = entries.map((e) => JSON.stringify(e)).join("\n");
+  const tmp = await Deno.makeTempFile({
+    dir,
+    prefix: "apis.",
+    suffix: ".jsonl.tmp",
+  });
+  try {
+    await Deno.writeTextFile(tmp, body.length ? body + "\n" : "");
+    await Deno.rename(tmp, registryPath());
+  } catch (err) {
+    await Deno.remove(tmp).catch(() => {});
+    throw err;
+  }
+}
+
 /** Replace the entry with the same id. Returns false if no entry matched. */
 export async function updateEntry(entry: RegistryEntry): Promise<boolean> {
   const entries = await readRegistry();
   const idx = entries.findIndex((e) => e.id === entry.id);
   if (idx === -1) return false;
   entries[idx] = entry;
-  const body = entries.map((e) => JSON.stringify(e)).join("\n");
-  await ensureConfigDir();
-  await Deno.writeTextFile(registryPath(), body.length ? body + "\n" : "");
+  await writeRegistry(entries);
   return true;
 }
 
@@ -119,8 +139,6 @@ export async function removeEntry(id: string): Promise<boolean> {
   const entries = await readRegistry();
   const kept = entries.filter((e) => e.id !== id);
   if (kept.length === entries.length) return false;
-  const body = kept.map((e) => JSON.stringify(e)).join("\n");
-  await ensureConfigDir();
-  await Deno.writeTextFile(registryPath(), body.length ? body + "\n" : "");
+  await writeRegistry(kept);
   return true;
 }

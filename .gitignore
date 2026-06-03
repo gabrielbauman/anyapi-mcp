@@ -1,8 +1,9 @@
 # Compiled binary produced by `deno task compile`
 /anyapi-mcp
 
-# Per-user local Claude Code settings
+# Per-user local Claude Code settings + runtime artifacts
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # Local scratch
 *.local

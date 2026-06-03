@@ -141,9 +141,31 @@ export async function runLogin(args: string[]): Promise<void> {
     );
   }
 
+  // Validate the (possibly overridden) endpoints before persisting, so a bad
+  // --auth-url/--token-url/--redirect-uri can't leave broken values on the entry.
+  for (
+    const [label, value] of [
+      ["--auth-url", auth.authorizationUrl],
+      ["--token-url", auth.tokenUrl],
+      ["redirect URI", auth.redirectUri],
+    ] as const
+  ) {
+    try {
+      new URL(value);
+    } catch {
+      console.error(`anyapi-mcp login: invalid ${label}: "${value}".`);
+      Deno.exit(1);
+    }
+  }
+
   // Persist creds and the (possibly updated) entry before the interactive flow.
   await saveClient(auth, client);
-  await updateEntry(entry);
+  if (!(await updateEntry(entry))) {
+    console.error(
+      `anyapi-mcp login: "${id}" is no longer registered; aborting.`,
+    );
+    Deno.exit(1);
+  }
 
   console.error(
     `Make sure your OAuth app's redirect/callback URL is: ${auth.redirectUri}`,

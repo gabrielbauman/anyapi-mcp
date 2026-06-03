@@ -145,13 +145,23 @@ interface TokenResponse {
   access_token?: string;
   refresh_token?: string;
   token_type?: string;
-  /** Seconds from now (RFC 6749). */
-  expires_in?: number;
-  /** Epoch seconds (used by e.g. Strava). */
-  expires_at?: number;
+  /** Seconds from now (RFC 6749). Some providers send it as a string. */
+  expires_in?: number | string;
+  /** Epoch seconds (used by e.g. Strava). May also arrive as a string. */
+  expires_at?: number | string;
   scope?: string;
   error?: string;
   error_description?: string;
+}
+
+/** Coerce a JSON number-or-numeric-string to a finite number, else undefined. */
+function asNumber(v: unknown): number | undefined {
+  if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
 }
 
 async function postToken(
@@ -203,11 +213,13 @@ function parseTokenResponse(
     );
   }
   const now = Date.now();
+  const expiresIn = asNumber(json.expires_in);
+  const expiresAtSec = asNumber(json.expires_at);
   let expiresAt: number | undefined;
-  if (typeof json.expires_in === "number") {
-    expiresAt = now + json.expires_in * 1000;
-  } else if (typeof json.expires_at === "number") {
-    expiresAt = json.expires_at * 1000;
+  if (expiresIn !== undefined) {
+    expiresAt = now + expiresIn * 1000;
+  } else if (expiresAtSec !== undefined) {
+    expiresAt = expiresAtSec * 1000;
   }
 
   const token: OAuthToken = {
@@ -334,9 +346,14 @@ export function buildAuthorizeUrl(opts: {
 }): string {
   const u = new URL(opts.authorizationUrl);
   // Apply extras first, skipping reserved keys, so the canonical params below
-  // always win even if something slipped a reserved key through.
-  for (const [k, v] of Object.entries(opts.extraParams ?? {})) {
-    if (!RESERVED_AUTHORIZE_PARAMS.has(k)) u.searchParams.set(k, v);
+  // always win even if something slipped a reserved key through. Keys are
+  // trimmed and matched case-insensitively so a stray "Redirect_Uri" or " state"
+  // can't sneak past the reserved-key guard.
+  for (const [rawKey, v] of Object.entries(opts.extraParams ?? {})) {
+    const key = rawKey.trim();
+    if (key && !RESERVED_AUTHORIZE_PARAMS.has(key.toLowerCase())) {
+      u.searchParams.set(key, v);
+    }
   }
   u.searchParams.set("response_type", "code");
   u.searchParams.set("client_id", opts.clientId);

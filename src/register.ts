@@ -73,8 +73,9 @@ export interface RegisterOptions {
 /**
  * Resolve the OAuth config to store, given discovered values and explicit
  * overrides. Precedence: explicit flag > known-provider quirk > discovered. The
- * quirk is looked up by the (pre-override) authorize host so a spec with the
- * right host but wrong paths (Strava) still gets corrected.
+ * quirk is looked up by the effective authorize host - an explicit --auth-url if
+ * given, otherwise the spec's - so a spec with the right host but wrong paths
+ * (Strava) still gets corrected.
  */
 function resolveOAuth(
   id: string,

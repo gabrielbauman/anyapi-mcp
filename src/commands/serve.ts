@@ -477,8 +477,10 @@ async function configureOAuthRequest(
   const changes: string[] = [];
 
   if (args.extraAuthParams !== undefined) {
+    // Normalize keys (trim) and match reserved names case-insensitively so a
+    // stray "Redirect_Uri" or " state" can't bypass the guard.
     const reserved = Object.keys(args.extraAuthParams).filter((k) =>
-      RESERVED_AUTHORIZE_PARAMS.has(k)
+      RESERVED_AUTHORIZE_PARAMS.has(k.trim().toLowerCase())
     );
     if (reserved.length) {
       return {
@@ -493,9 +495,11 @@ async function configureOAuthRequest(
     }
     // Merge into the existing map; an empty-string value removes a key.
     const next: Record<string, string> = { ...(auth.extraAuthParams ?? {}) };
-    for (const [k, v] of Object.entries(args.extraAuthParams)) {
-      if (v === "") delete next[k];
-      else next[k] = v;
+    for (const [rawKey, v] of Object.entries(args.extraAuthParams)) {
+      const key = rawKey.trim();
+      if (!key) continue;
+      if (v === "") delete next[key];
+      else next[key] = v;
     }
     if (Object.keys(next).length) auth.extraAuthParams = next;
     else delete auth.extraAuthParams;
@@ -520,7 +524,14 @@ async function configureOAuthRequest(
     return { text: await reportOAuthConfig(entry, auth), isError: false };
   }
 
-  await updateEntry(entry);
+  if (!(await updateEntry(entry))) {
+    return {
+      text:
+        `Could not persist OAuth config for "${args.api}": it is no longer ` +
+        `registered (it may have been removed concurrently). Re-check with the CLI.`,
+      isError: true,
+    };
+  }
   const followUp = scopesChanged
     ? ` Scopes changed - call the authenticate tool for "${args.api}" to mint a token with the new scopes.`
     : ` Takes effect at the next login; call authenticate if a fresh consent is needed.`;
