@@ -96,6 +96,7 @@ function isSwagger2(spec: Json): boolean {
  */
 async function maybeConvertSwagger2(
   spec: Json,
+  source: string,
   log: (message: string) => void,
 ): Promise<Json | undefined> {
   if (!isSwagger2(spec)) return undefined;
@@ -105,6 +106,12 @@ async function maybeConvertSwagger2(
     const result = await swagger2openapi.convertObj(spec, {
       patch: true, // auto-fix minor spec errors instead of aborting
       warnOnly: true, // tolerate non-fatal validation issues
+      // Inline external $refs (resolved relative to `source`) during conversion
+      // so the converted document is self-contained. generateTypesFromSpec then
+      // writes it to a temp file whose directory can't affect ref resolution -
+      // which matters for multi-file local specs and relative refs in remote ones.
+      resolve: true,
+      source,
     });
     openapi = result?.openapi;
   } catch (err) {
@@ -321,7 +328,8 @@ async function generateTypes(
 /**
  * Generate types from an in-memory (converted) spec. openapi-typescript reads a
  * path or URL, so the spec is materialized to a temp file solely for the CLI run
- * and removed afterward.
+ * and removed afterward. The spec is self-contained (maybeConvertSwagger2 already
+ * inlined external $refs), so the temp directory has no bearing on resolution.
  */
 async function generateTypesFromSpec(
   spec: Json,
@@ -351,7 +359,7 @@ export const openapiAdapter: ProtocolAdapter = {
     const loaded = await loadSpec(source);
     // Swagger 2.0 sources are normalized to OpenAPI 3.0 here; `converted` is
     // undefined for specs that were already 3.x.
-    const converted = await maybeConvertSwagger2(loaded, log);
+    const converted = await maybeConvertSwagger2(loaded, source, log);
     const spec = converted ?? loaded;
     const baseUrl = opts.baseUrlOverride ?? resolveBaseUrl(spec, source);
     const hosts = hostsFromBaseUrl(baseUrl);
