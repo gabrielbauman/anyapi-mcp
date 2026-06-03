@@ -73,10 +73,11 @@ protocol plugs in through one in-tree adapter object.
   the entry, its secrets, and its cached artifacts. `regenerateApi`/
   `regenerateApis` re-run only codegen (re-fetch source → rewrite types + ops,
   bump `addedAt`) while preserving the entry's auth/baseUrl/hosts — no secret is
-  written or deleted (a bearer token is only read, to re-introspect). Each
-  generated artifact is stamped with `CODEGEN_VERSION`; bump that constant when
-  a generator change makes old artifacts stale, and `serve` regenerates anything
-  older on startup (an entry missing the stamp counts as stale).
+  written or deleted (a bearer token is only read, to re-introspect). Each entry
+  records (in `codegenVersion`) the `CODEGEN_VERSION` its artifacts were built
+  under; bump that constant when a generator change makes old artifacts stale,
+  and `serve` regenerates anything older on startup (an entry missing the stamp
+  counts as stale).
 - `src/operation.ts`: operation index + keyword `search` (no embeddings). Params
   carry optional `description`/`enum`, surfaced in search (`clampDescription`/
   `applyEnum` bound their size; `enum` holds only real values — an over-cap

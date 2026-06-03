@@ -56,7 +56,10 @@ export interface RegistryEntry {
   /** Documentation URL: stored and surfaced, never parsed. */
   docsUrl?: string;
   auth: Auth;
-  /** Absolute path to the generated .d.ts in the cache dir. */
+  /**
+   * Absolute path to the generated types/client file in the cache dir: a `.d.ts`
+   * for type-only outputs (OpenAPI, GraphQL), a `.ts` runtime module for SOAP.
+   */
   typesPath: string;
   /**
    * The `CODEGEN_VERSION` the cached artifacts (types + ops index) were built
