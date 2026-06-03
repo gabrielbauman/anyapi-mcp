@@ -1,5 +1,5 @@
 // `anyapi-mcp serve` - stdio MCP server exposing `search`, `execute`,
-// `authenticate`, `configure_oauth`, and `add_api`.
+// `authenticate`, `configure_oauth`, `add_api`, `list_apis`, and `remove_api`.
 //
 // The registry is re-read on each call (hot-reload), so an API registered mid-
 // session - via the add_api tool or the `anyapi-mcp add` CLI - is usable without a
@@ -20,7 +20,7 @@ import {
 import { isUrl } from "../openapi.ts";
 import { type OperationInfo, readOpsIndex } from "../operation.ts";
 import { getSecret } from "../keystore.ts";
-import { registerApi } from "../register.ts";
+import { registerApi, unregisterApi } from "../register.ts";
 import { getAdapter } from "../adapters.ts";
 import { runSandboxed } from "../execute/run.ts";
 import {
@@ -39,21 +39,31 @@ const MAX_RESULTS = 25;
 const SEARCH_DESCRIPTION =
   `Search registered API operations by keyword. Returns compact matches - ` +
   `{ api, method, path, operationId, summary, params, requestBodyHint } - so you ` +
-  `can learn which path + method to call and roughly what arguments it takes. ` +
+  `can learn which path + method to call and roughly what arguments it takes. Each ` +
+  `param lists its name and type, plus a description and its allowed "enum" values ` +
+  `when the spec provides them, so you can pick valid arguments without a failed call. ` +
   `Feed what you learn into the "execute" tool. When an endpoint exists in several ` +
   `versions, the newest (e.g. v2 over v1) is ranked first unless your query names a ` +
   `version. Optionally pass "api" to restrict the search to one registered API id.`;
 
 const EXECUTE_DESCRIPTION =
-  `Run TypeScript against a registered API. A typed openapi-fetch client named ` +
-  `"client" is already in scope, with auth injected automatically. Call it like ` +
-  '`const { data, error } = await client.GET("/pet/{petId}", { params: { path: { petId: 1 } } });` ' +
-  "- methods are GET/POST/PUT/PATCH/DELETE, options are { params: { path, query }, body }, " +
-  `and each returns { data, error, response }. ` +
-  "`response.status` is always available; on success `data` is set, on an HTTP error " +
-  "`error` is set (no throw) - narrow on `data` for success. console.log anything you want back. " +
-  `Chain multiple calls in one execution: intermediate results stay in the sandbox ` +
-  `instead of round-tripping through you. Input: { api: <registered id>, code: <typescript> }.`;
+  `Run TypeScript against a registered API. A typed "client" is already in scope, with auth ` +
+  `injected automatically. The client's shape depends on the API's kind (shown by list_apis; ` +
+  `search's method also signals it):\n` +
+  '- OpenAPI: an openapi-fetch client - `const { data, error } = await client.GET("/pet/{petId}", ' +
+  "{ params: { path: { petId: 1 } } });`. Methods are GET/POST/PUT/PATCH/DELETE; options are " +
+  "{ params: { path, query }, body }; each returns { data, error, response }. response.status is " +
+  "always set; on success data is set, on an HTTP error error is set (no throw) - narrow on data.\n" +
+  "- GraphQL (search method QUERY/MUTATION): `client.query(query, variables?)` and " +
+  "`client.mutate(query, variables?)`, each returning { data, errors }; introspected types are " +
+  "available as Schema.* (e.g. `client.query<{ user: Schema.User }>(...)`).\n" +
+  "- SOAP (kind soap): one method per operation - " +
+  "`const { status, data, raw } = await client.OperationName({ ...args });` (data is the parsed Body).\n" +
+  `console.log anything you want back. Chain multiple calls in one execution: intermediate results ` +
+  `stay in the sandbox instead of round-tripping through you. Set check:false to skip type-checking ` +
+  `for one run (use when a stale spec enum rejects a value the live API accepts; you lose type ` +
+  `feedback that run). Set timeoutMs to raise the 30s default (max 120000) for long or paginated ` +
+  `runs. Input: { api: <registered id>, code: <typescript>, check?: boolean, timeoutMs?: number }.`;
 
 const AUTHENTICATE_DESCRIPTION =
   "Start the OAuth browser login for a registered OAuth API: opens the user's browser to the " +
@@ -79,7 +89,23 @@ const ADD_API_DESCRIPTION =
   'URL (kind "soap"). Generates a typed client and makes the API available immediately (no ' +
   "restart). Use this for public APIs. For an API that requires a secret token, do NOT pass the " +
   "token here - tell the user to run `anyapi-mcp add <url> --token [--kind …]` in a " +
-  "shell, which stores it in the OS keychain. Input: { specUrl, kind?, id?, name?, baseUrl?, docsUrl? }.";
+  "shell, which stores it in the OS keychain. If the spec's server can't be derived (it lands on a " +
+  "raw-file host like raw.githubusercontent.com), registration fails loudly - pass baseUrl with the " +
+  "real API base. If an id already exists, pass force:true to overwrite it in place (e.g. to fix a " +
+  "wrong baseUrl); an OAuth API stays logged in across the overwrite. " +
+  "Input: { specUrl, kind?, id?, name?, baseUrl?, docsUrl?, force? }.";
+
+const LIST_APIS_DESCRIPTION =
+  "List the registered APIs as JSON - each with id, name, kind (openapi/graphql/soap), baseUrl, " +
+  "operation count, auth status (including OAuth login/expiry), and docsUrl. Use it to see what's " +
+  "available, to confirm an add_api/remove_api took effect, or to check an API's base URL and kind " +
+  "(the kind determines the execute client shape). No input.";
+
+const REMOVE_API_DESCRIPTION =
+  "Unregister an API by id: removes its registry entry, deletes any stored secrets (bearer token, " +
+  "or OAuth client credentials + tokens) from the OS keychain, and cleans up its cached client types " +
+  "and operation index. Use it to clear a mistaken or stale registration (or pass force:true to " +
+  "add_api to overwrite one in place instead). Input: { api: <registered id> }.";
 
 /** How-to-register guidance, surfaced when the registry is empty. */
 function howToAdd(): string {
@@ -95,9 +121,11 @@ function howToAdd(): string {
 
 function buildInstructions(entries: RegistryEntry[]): string {
   const intro =
-    "anyapi-mcp turns OpenAPI HTTP APIs into code you run. `search` finds operations; `execute` runs " +
-    "TypeScript against a typed openapi-fetch `client` (chain several calls in one execute - " +
-    "intermediate data stays in the sandbox, saving round-trips). `add_api` registers new APIs.";
+    "anyapi-mcp turns HTTP APIs (OpenAPI, GraphQL, SOAP) into code you run. `search` finds " +
+    "operations; `execute` runs TypeScript against a typed `client` (chain several calls in one " +
+    "execute - intermediate data stays in the sandbox, saving round-trips). `list_apis` shows what's " +
+    "registered; `add_api` registers more (force:true overwrites a wrong one) and `remove_api` " +
+    "deletes one.";
   const oauthNote =
     "\n\nSome APIs use OAuth 2.0. If execute reports that one needs authentication, call the " +
     "`authenticate` tool with its id to open a browser login for the user (or tell the user to run " +
@@ -285,6 +313,7 @@ async function executeRequest(
   entries: RegistryEntry[],
   api: string,
   code: string,
+  opts: { check?: boolean; timeoutMs?: number } = {},
 ): Promise<{ text: string; isError: boolean }> {
   if (entries.length === 0) {
     return {
@@ -330,9 +359,13 @@ async function executeRequest(
     source,
     entry.hosts,
     token,
+    { check: opts.check, timeoutMs: opts.timeoutMs },
   );
+  const note = opts.check === false
+    ? "note: type-checking was disabled for this run (check:false).\n"
+    : "";
   return {
-    text: formatResult(stdout, stderr, exitCode),
+    text: note + formatResult(stdout, stderr, exitCode),
     isError: exitCode !== 0,
   };
 }
@@ -543,6 +576,53 @@ async function configureOAuthRequest(
   };
 }
 
+// ---- list / remove ----
+
+/** JSON summary of every registered API (id, name, kind, base, op count, auth). */
+async function listApisResult(state: ServeState): Promise<string> {
+  const apis: Record<string, unknown>[] = [];
+  for (const e of state.entries) {
+    const ops = state.opsById.get(e.id);
+    let auth: string = e.auth.kind;
+    if (e.auth.kind === "oauth2") {
+      const token = await loadToken(e.auth);
+      auth = token
+        ? `oauth2 (logged in, ${describeExpiry(token)})`
+        : "oauth2 (not logged in)";
+    }
+    const api: Record<string, unknown> = {
+      id: e.id,
+      name: e.name,
+      kind: e.kind,
+      baseUrl: e.baseUrl,
+      operations: ops ? ops.length : null,
+      auth,
+    };
+    if (e.docsUrl) api.docsUrl = e.docsUrl;
+    apis.push(api);
+  }
+  return JSON.stringify(apis, null, 2);
+}
+
+async function removeApiRequest(
+  entries: RegistryEntry[],
+  api: string,
+): Promise<{ text: string; isError: boolean }> {
+  const { removed, secretsNote } = await unregisterApi(api);
+  if (!removed) {
+    const known = entries.map((e) => e.id).join(", ") || "(none)";
+    return {
+      text: `Unknown api "${api}"; nothing to remove. Registered ids: ${known}`,
+      isError: true,
+    };
+  }
+  return {
+    text: `Removed "${api}"${secretsNote ? ` (${secretsNote})` : ""}. ` +
+      `Its types and operation index are deleted; it no longer appears in search/execute.`,
+    isError: false,
+  };
+}
+
 // ---- server ----
 
 export async function runServe(_args: string[]): Promise<void> {
@@ -589,7 +669,19 @@ export async function runServe(_args: string[]): Promise<void> {
     },
   );
 
-  const executeShape = { api: z.string(), code: z.string() };
+  const executeShape = {
+    api: z.string().describe("Registered API id (see list_apis)"),
+    code: z.string().describe(
+      "TypeScript to run; a typed `client` is in scope",
+    ),
+    check: z.boolean().optional().describe(
+      "Type-check before running (default true). Set false to bypass a stale spec " +
+        "enum that rejects a value the live API accepts; you lose type feedback that run.",
+    ),
+    timeoutMs: z.number().optional().describe(
+      "Max run time in ms (default 30000, clamped to 1000-120000); raise it for long or paginated runs.",
+    ),
+  };
   type ExecuteArgs = z.infer<z.ZodObject<typeof executeShape>>;
   server.registerTool(
     "execute",
@@ -598,9 +690,12 @@ export async function runServe(_args: string[]): Promise<void> {
       description: EXECUTE_DESCRIPTION,
       inputSchema: executeShape,
     },
-    async ({ api, code }: ExecuteArgs) => {
+    async ({ api, code, check, timeoutMs }: ExecuteArgs) => {
       const { entries } = await loadState();
-      const { text, isError } = await executeRequest(entries, api, code);
+      const { text, isError } = await executeRequest(entries, api, code, {
+        check,
+        timeoutMs,
+      });
       return { content: [{ type: "text" as const, text }], isError };
     },
   );
@@ -670,6 +765,9 @@ export async function runServe(_args: string[]): Promise<void> {
     docsUrl: z.string().optional().describe(
       "Documentation URL to store and surface",
     ),
+    force: z.boolean().optional().describe(
+      "Overwrite an existing API with the same id instead of failing (e.g. to fix a wrong baseUrl)",
+    ),
   };
   type AddApiArgs = z.infer<z.ZodObject<typeof addApiShape>>;
   server.registerTool(
@@ -679,23 +777,29 @@ export async function runServe(_args: string[]): Promise<void> {
       description: ADD_API_DESCRIPTION,
       inputSchema: addApiShape,
     },
-    async ({ specUrl, kind, id, name, baseUrl, docsUrl }: AddApiArgs) => {
+    async (
+      { specUrl, kind, id, name, baseUrl, docsUrl, force }: AddApiArgs,
+    ) => {
       try {
         const specSource = isUrl(specUrl) ? specUrl : resolve(specUrl);
-        const { entry, operationCount } = await registerApi({
+        const { entry, operationCount, overwritten } = await registerApi({
           specSource,
           kind,
           id,
           name,
           baseUrl,
           docsUrl,
+          force,
         });
         const kindFlag = entry.kind === "openapi"
           ? ""
           : ` --kind ${entry.kind}`;
         const head =
-          `Registered "${entry.id}" (${entry.name}): ${operationCount} operations, ` +
-          `base ${entry.baseUrl}. Available now - call search with api "${entry.id}", then execute.`;
+          `${
+            overwritten ? "Re-registered" : "Registered"
+          } "${entry.id}" (${entry.name}): ` +
+          `${operationCount} operations, base ${entry.baseUrl}. ` +
+          `Available now - call search with api "${entry.id}", then execute.`;
         const authHelp = entry.auth.kind === "oauth2"
           ? ` This API uses OAuth 2.0. The user must create an OAuth app (redirect ` +
             `URL ${entry.auth.redirectUri}) and run \`anyapi-mcp login ${entry.id} ` +
@@ -717,6 +821,39 @@ export async function runServe(_args: string[]): Promise<void> {
           isError: true,
         };
       }
+    },
+  );
+
+  server.registerTool(
+    "list_apis",
+    {
+      title: "List registered APIs",
+      description: LIST_APIS_DESCRIPTION,
+      inputSchema: {},
+    },
+    async () => {
+      const state = await loadState();
+      return {
+        content: [{ type: "text" as const, text: await listApisResult(state) }],
+      };
+    },
+  );
+
+  const removeApiShape = {
+    api: z.string().describe("Registered API id to unregister"),
+  };
+  type RemoveApiArgs = z.infer<z.ZodObject<typeof removeApiShape>>;
+  server.registerTool(
+    "remove_api",
+    {
+      title: "Unregister an API",
+      description: REMOVE_API_DESCRIPTION,
+      inputSchema: removeApiShape,
+    },
+    async ({ api }: RemoveApiArgs) => {
+      const { entries } = await loadState();
+      const { text, isError } = await removeApiRequest(entries, api);
+      return { content: [{ type: "text" as const, text }], isError };
     },
   );
 

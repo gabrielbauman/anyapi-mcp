@@ -5,6 +5,7 @@
 import { toFileUrl } from "@std/path";
 import { ensureCacheDir } from "./paths.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
+import { applyEnum, clampDescription } from "./operation.ts";
 import type { OperationInfo, OperationParam } from "./operation.ts";
 import type { RegistryEntry } from "./registry.ts";
 
@@ -108,19 +109,40 @@ function renderTypeRef(t: TypeRef): string {
 
 // ---- operation index ----
 
-function buildParams(args: InputValue[]): OperationParam[] {
-  return args.map((a) => ({
-    name: a.name,
-    in: "argument" as const,
-    required: a.type.kind === "NON_NULL",
-    type: renderTypeRef(a.type),
-  }));
+/** Unwrap NON_NULL/LIST wrappers to the underlying named type (for enum lookup). */
+function namedTypeName(t: TypeRef): string | undefined {
+  let cur: TypeRef | null | undefined = t;
+  while (cur && (cur.kind === "NON_NULL" || cur.kind === "LIST")) {
+    cur = cur.ofType;
+  }
+  return cur?.name ?? undefined;
+}
+
+function buildParams(
+  args: InputValue[],
+  enumsByType: Map<string, string[]>,
+): OperationParam[] {
+  return args.map((a) => {
+    const param: OperationParam = {
+      name: a.name,
+      in: "argument" as const,
+      required: a.type.kind === "NON_NULL",
+      type: renderTypeRef(a.type),
+    };
+    const description = clampDescription(a.description);
+    if (description) param.description = description;
+    const named = namedTypeName(a.type);
+    const values = named ? enumsByType.get(named) : undefined;
+    if (values) applyEnum(param, values);
+    return param;
+  });
 }
 
 function fieldsToOps(
   type: FullType | undefined,
   method: string,
   tag: string,
+  enumsByType: Map<string, string[]>,
 ): OperationInfo[] {
   if (!type?.fields) return [];
   return type.fields.map((f) => {
@@ -129,7 +151,7 @@ function fieldsToOps(
       path: f.name,
       operationId: f.name,
       tags: [tag],
-      params: buildParams(f.args ?? []),
+      params: buildParams(f.args ?? [], enumsByType),
       returns: renderTypeRef(f.type),
     };
     if (f.description) op.summary = f.description;
@@ -139,7 +161,14 @@ function fieldsToOps(
 
 function buildOperationIndex(schema: GqlSchema): OperationInfo[] {
   const byName = new Map<string, FullType>();
-  for (const t of schema.types) if (t.name) byName.set(t.name, t);
+  const enumsByType = new Map<string, string[]>();
+  for (const t of schema.types) {
+    if (!t.name) continue;
+    byName.set(t.name, t);
+    if (t.kind === "ENUM" && t.enumValues?.length) {
+      enumsByType.set(t.name, t.enumValues.map((v) => v.name));
+    }
+  }
   const queryType = schema.queryType
     ? byName.get(schema.queryType.name)
     : undefined;
@@ -147,8 +176,8 @@ function buildOperationIndex(schema: GqlSchema): OperationInfo[] {
     ? byName.get(schema.mutationType.name)
     : undefined;
   return [
-    ...fieldsToOps(queryType, "query", "Query"),
-    ...fieldsToOps(mutationType, "mutation", "Mutation"),
+    ...fieldsToOps(queryType, "query", "Query", enumsByType),
+    ...fieldsToOps(mutationType, "mutation", "Mutation", enumsByType),
   ];
 }
 

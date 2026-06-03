@@ -28,6 +28,7 @@ Options:
   --scope <name>     Scope to request at login (repeatable; default: the spec's scopes)
   --scope-separator <sep>  Scope separator in the authorize URL (default " "; Strava uses ",")
   --no-auth          Register without authentication
+  --force            Overwrite an existing API with the same id instead of failing
   -h, --help         Show this help
 
 OpenAPI specs that declare an OAuth2 authorization-code flow are detected
@@ -55,7 +56,7 @@ export async function runAdd(args: string[]): Promise<void> {
       "scope-separator",
     ],
     collect: ["scope"],
-    boolean: ["help", "no-auth", "token", "oauth"],
+    boolean: ["help", "no-auth", "token", "oauth", "force"],
     alias: { h: "help" },
   });
 
@@ -97,7 +98,7 @@ export async function runAdd(args: string[]): Promise<void> {
 
   const scopes = (flags.scope as string[] | undefined) ?? [];
   try {
-    const { entry, operationCount } = await registerApi({
+    const { entry, operationCount, overwritten } = await registerApi({
       specSource,
       kind: flags.kind as ApiKind | undefined,
       id: flags.id,
@@ -111,6 +112,7 @@ export async function runAdd(args: string[]): Promise<void> {
       scopes: scopes.length ? scopes : undefined,
       scopeSeparator: flags["scope-separator"],
       noAuth: flags["no-auth"],
+      force: flags.force,
       onProgress: (m) => console.error(m),
     });
     const authLine = entry.auth.kind === "bearer"
@@ -119,7 +121,9 @@ export async function runAdd(args: string[]): Promise<void> {
       ? `oauth2 (not logged in)`
       : entry.auth.kind;
     console.error(
-      `Registered "${entry.id}" (${entry.name})\n` +
+      `${
+        overwritten ? "Re-registered" : "Registered"
+      } "${entry.id}" (${entry.name})\n` +
         `  kind:     ${entry.kind}\n` +
         `  base URL: ${entry.baseUrl}\n` +
         `  hosts:    ${entry.hosts.join(", ")}\n` +
