@@ -647,13 +647,16 @@ function tagCounts(
 async function listApisResult(
   state: ServeState,
   apiFilter?: string,
-): Promise<string> {
+): Promise<{ text: string; isError: boolean }> {
   const entries = apiFilter
     ? state.entries.filter((e) => e.id === apiFilter)
     : state.entries;
   if (apiFilter && entries.length === 0) {
     const known = state.entries.map((e) => e.id).join(", ") || "(none)";
-    return `Unknown api "${apiFilter}". Registered ids: ${known}`;
+    return {
+      text: `Unknown api "${apiFilter}". Registered ids: ${known}`,
+      isError: true,
+    };
   }
   const apis: Record<string, unknown>[] = [];
   for (const e of entries) {
@@ -686,7 +689,7 @@ async function listApisResult(
     }
     apis.push(api);
   }
-  return JSON.stringify(apis, null, 2);
+  return { text: JSON.stringify(apis), isError: false };
 }
 
 async function removeApiRequest(
@@ -776,7 +779,7 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: searchShape,
     },
     async ({ query, api, limit }: SearchArgs) => {
-      const state = await loadState();
+      const state = await loadStateSynced();
       if (state.entries.length === 0) {
         return {
           content: [{
@@ -810,7 +813,7 @@ export async function runServe(_args: string[]): Promise<void> {
     ),
   };
   type ExecuteArgs = z.infer<z.ZodObject<typeof executeShape>>;
-  server.registerTool(
+  const executeTool = server.registerTool(
     "execute",
     {
       title: "Execute TypeScript against an API",
@@ -818,7 +821,7 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: executeShape,
     },
     async ({ api, code, check, timeoutMs }: ExecuteArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await executeRequest(entries, api, code, {
         check,
         timeoutMs,
@@ -826,6 +829,35 @@ export async function runServe(_args: string[]): Promise<void> {
       return { content: [{ type: "text" as const, text }], isError };
     },
   );
+
+  // The execute description above lists only the client shapes for the kinds
+  // present at startup, but the registry hot-reloads on every tool call: a
+  // mid-session add_api/remove_api (or an external `anyapi-mcp add`) can
+  // introduce or drop a kind. Re-derive the description whenever the loaded
+  // kind-set changes and push a tools/list_changed via update(); loadStateSynced
+  // wraps the per-call registry read so every handler keeps execute current.
+  let executeKinds = [...new Set(startup.entries.map((e) => e.kind))]
+    .sort()
+    .join(",");
+
+  function syncExecuteDescription(entries: RegistryEntry[]): void {
+    const kinds = new Set<ApiKind>(entries.map((e) => e.kind));
+    const key = [...kinds].sort().join(",");
+    if (key === executeKinds) return;
+    executeKinds = key;
+    executeTool.update({ description: buildExecuteDescription(kinds) });
+    console.error(
+      `anyapi-mcp serve: execute description updated for kinds [${
+        key || "none"
+      }].`,
+    );
+  }
+
+  async function loadStateSynced(): Promise<ServeState> {
+    const state = await loadState();
+    syncExecuteDescription(state.entries);
+    return state;
+  }
 
   const authenticateShape = { api: z.string() };
   type AuthenticateArgs = z.infer<z.ZodObject<typeof authenticateShape>>;
@@ -837,7 +869,7 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: authenticateShape,
     },
     async ({ api }: AuthenticateArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await authenticateRequest(entries, api);
       return { content: [{ type: "text" as const, text }], isError };
     },
@@ -867,7 +899,7 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: configureOAuthShape,
     },
     async (args: ConfigureOAuthToolArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await configureOAuthRequest(entries, args);
       return { content: [{ type: "text" as const, text }], isError };
     },
@@ -936,6 +968,10 @@ export async function runServe(_args: string[]): Promise<void> {
           : ` If requests come back 401/403 this API needs a token: run ` +
             `\`anyapi-mcp add ${specSource} --id ${entry.id} --token${kindFlag}\` in a shell so the token ` +
             `is stored in your OS keychain (never through this chat).`;
+        // A new registration may introduce a kind (e.g. the first GraphQL/SOAP
+        // API in an OpenAPI-only session); refresh the execute description so its
+        // client shape is documented immediately.
+        syncExecuteDescription(await readRegistry());
         return { content: [{ type: "text" as const, text: head + authHelp }] };
       } catch (err) {
         return {
@@ -965,13 +1001,9 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: listApisShape,
     },
     async ({ api }: ListApisArgs) => {
-      const state = await loadState();
-      return {
-        content: [{
-          type: "text" as const,
-          text: await listApisResult(state, api),
-        }],
-      };
+      const state = await loadStateSynced();
+      const { text, isError } = await listApisResult(state, api);
+      return { content: [{ type: "text" as const, text }], isError };
     },
   );
 
@@ -987,8 +1019,10 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: removeApiShape,
     },
     async ({ api }: RemoveApiArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await removeApiRequest(entries, api);
+      // Removing the last API of a kind drops its client shape from execute.
+      if (!isError) syncExecuteDescription(entries.filter((e) => e.id !== api));
       return { content: [{ type: "text" as const, text }], isError };
     },
   );
