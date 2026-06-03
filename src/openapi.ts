@@ -58,9 +58,9 @@ function stripTrailingSlash(s: string): string {
 /**
  * Parse spec text as JSON, falling back to YAML. JSON is tried first so JSON
  * specs keep exact JSON semantics (and skip the slower YAML path); a YAML spec
- * fails the JSON parse and is then parsed as YAML. This only feeds the index /
- * base-URL derivation below - openapi-typescript reads the original source for
- * type generation and handles either format itself.
+ * fails the JSON parse and is then parsed as YAML. This parse only feeds the
+ * operation index and base-URL derivation below; type generation is handled
+ * separately by openapi-typescript, which parses YAML or JSON itself.
  */
 function parseSpec(text: string): unknown {
   try {
