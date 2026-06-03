@@ -12,6 +12,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { resolve } from "@std/path";
 import { z } from "zod";
 import {
+  type ApiKind,
   type OAuth2Auth,
   readRegistry,
   type RegistryEntry,
@@ -39,7 +40,11 @@ import {
   saveToken,
 } from "../oauth.ts";
 
-const MAX_RESULTS = 25;
+const DEFAULT_LIMIT = 25;
+const MAX_LIMIT = 50;
+// The capability map (list_apis drill-in) shows only the busiest areas so it stays
+// an overview, not a second index; a fine-grained spec can carry hundreds of tags.
+const MAX_CAPABILITY_TAGS = 40;
 
 const SEARCH_DESCRIPTION =
   `Search registered API operations by keyword. Returns compact matches - ` +
@@ -49,26 +54,47 @@ const SEARCH_DESCRIPTION =
   `when the spec provides them, so you can pick valid arguments without a failed call. ` +
   `Feed what you learn into the "execute" tool. When an endpoint exists in several ` +
   `versions, the newest (e.g. v2 over v1) is ranked first unless your query names a ` +
-  `version. Optionally pass "api" to restrict the search to one registered API id.`;
+  `version. Optionally pass "api" to restrict the search to one registered API id, and "limit" to ` +
+  `cap how many matches come back (default 25, max 50).`;
 
-const EXECUTE_DESCRIPTION =
-  `Run TypeScript against a registered API. A typed "client" is already in scope, with auth ` +
-  `injected automatically. The client's shape depends on the API's kind (shown by list_apis; ` +
-  `search's method also signals it):\n` +
-  '- OpenAPI: an openapi-fetch client - `const { data, error } = await client.GET("/pet/{petId}", ' +
-  "{ params: { path: { petId: 1 } } });`. Methods are GET/POST/PUT/PATCH/DELETE; options are " +
-  "{ params: { path, query }, body }; each returns { data, error, response }. response.status is " +
-  "always set; on success data is set, on an HTTP error error is set (no throw) - narrow on data.\n" +
-  "- GraphQL (search method QUERY/MUTATION): `client.query(query, variables?)` and " +
-  "`client.mutate(query, variables?)`, each returning { data, errors }; introspected types are " +
-  "available as Schema.* (e.g. `client.query<{ user: Schema.User }>(...)`).\n" +
-  "- SOAP (kind soap): one method per operation - " +
-  "`const { status, data, raw } = await client.OperationName({ ...args });` (data is the parsed Body).\n" +
-  `console.log anything you want back. Chain multiple calls in one execution: intermediate results ` +
-  `stay in the sandbox instead of round-tripping through you. Set check:false to skip type-checking ` +
-  `for one run (use when a stale spec enum rejects a value the live API accepts; you lose type ` +
-  `feedback that run). Set timeoutMs to raise the 30s default (max 120000) for long or paginated ` +
-  `runs. Input: { api: <registered id>, code: <typescript>, check?: boolean, timeoutMs?: number }.`;
+/** Per-kind client-shape blurbs, assembled into the execute description for the kinds present. */
+const EXEC_SHAPE_BULLETS: Record<ApiKind, string> = {
+  openapi:
+    '- OpenAPI: an openapi-fetch client - `const { data, error } = await client.GET("/pet/{petId}", ' +
+    "{ params: { path: { petId: 1 } } });`. Methods are GET/POST/PUT/PATCH/DELETE; options are " +
+    "{ params: { path, query }, body }; each returns { data, error, response }. response.status is " +
+    "always set; on success data is set, on an HTTP error error is set (no throw) - narrow on data.\n",
+  graphql:
+    "- GraphQL (search method QUERY/MUTATION): `client.query(query, variables?)` and " +
+    "`client.mutate(query, variables?)`, each returning { data, errors }; introspected types are " +
+    "available as Schema.* (e.g. `client.query<{ user: Schema.User }>(...)`).\n",
+  soap: "- SOAP (kind soap): one method per operation - " +
+    "`const { status, data, raw } = await client.OperationName({ ...args });` (data is the parsed Body).\n",
+};
+
+/**
+ * The execute tool description, carrying only the client-shape blurbs for the API
+ * kinds actually registered - an OpenAPI-only setup needn't keep the GraphQL/SOAP
+ * shapes in always-on context. Falls back to all kinds when the registry is empty.
+ */
+function buildExecuteDescription(kinds: Set<ApiKind>): string {
+  const head =
+    `Run TypeScript against a registered API. A typed "client" is already in scope, with auth ` +
+    `injected automatically. The client's shape depends on the API's kind (shown by list_apis; ` +
+    `search's method also signals it):\n`;
+  const order: ApiKind[] = ["openapi", "graphql", "soap"];
+  const bullets = order
+    .filter((k) => kinds.size === 0 || kinds.has(k))
+    .map((k) => EXEC_SHAPE_BULLETS[k])
+    .join("");
+  const tail =
+    `console.log anything you want back. Chain multiple calls in one execution: intermediate results ` +
+    `stay in the sandbox instead of round-tripping through you. Set check:false to skip type-checking ` +
+    `for one run (use when a stale spec enum rejects a value the live API accepts; you lose type ` +
+    `feedback that run). Set timeoutMs to raise the 30s default (max 120000) for long or paginated ` +
+    `runs. Input: { api: <registered id>, code: <typescript>, check?: boolean, timeoutMs?: number }.`;
+  return head + bullets + tail;
+}
 
 const AUTHENTICATE_DESCRIPTION =
   "Start the OAuth browser login for a registered OAuth API: opens the user's browser to the " +
@@ -102,9 +128,11 @@ const ADD_API_DESCRIPTION =
 
 const LIST_APIS_DESCRIPTION =
   "List the registered APIs as JSON - each with id, name, kind (openapi/graphql/soap), baseUrl, " +
-  "operation count, auth status (including OAuth login/expiry), and docsUrl. Use it to see what's " +
-  "available, to confirm an add_api/remove_api took effect, or to check an API's base URL and kind " +
-  "(the kind determines the execute client shape). No input.";
+  "operation count, a short description (when the spec provides one), auth status (including OAuth " +
+  "login/expiry), and docsUrl. Use it to see what's available and what each API is for, or to confirm " +
+  "an add_api/remove_api took effect. Pass an `api` id to get just that one API plus its capability " +
+  "map - the operation tags with per-tag counts - so you can see an API's areas before searching " +
+  "within one. The kind determines the execute client shape.";
 
 const REMOVE_API_DESCRIPTION =
   "Unregister an API by id: removes its registry entry, deletes any stored secrets (bearer token, " +
@@ -130,7 +158,8 @@ function buildInstructions(entries: RegistryEntry[]): string {
     "operations; `execute` runs TypeScript against a typed `client` (chain several calls in one " +
     "execute - intermediate data stays in the sandbox, saving round-trips). `list_apis` shows what's " +
     "registered; `add_api` registers more (force:true overwrites a wrong one) and `remove_api` " +
-    "deletes one.";
+    "deletes one. To see what an API can do, call `list_apis` with its `api` id for a description " +
+    "and its capability areas (operation tags), then `search` within one.";
   const oauthNote =
     "\n\nSome APIs use OAuth 2.0. If execute reports that one needs authentication, call the " +
     "`authenticate` tool with its id to open a browser login for the user (or tell the user to run " +
@@ -265,6 +294,7 @@ function searchOperations(
   state: ServeState,
   query: string,
   apiFilter: string | undefined,
+  limit: number | undefined,
 ): SearchMatch[] {
   const tokens = tokenize(query);
   const scored: { score: number; version: number; match: SearchMatch }[] = [];
@@ -297,7 +327,8 @@ function searchOperations(
   // Relevance first; for equal relevance (e.g. /v1/x vs /v2/x), prefer the newer
   // version. A query that names a version scores it higher, so it still wins.
   scored.sort((a, b) => (b.score - a.score) || (b.version - a.version));
-  return scored.slice(0, MAX_RESULTS).map((s) => s.match);
+  const cap = Math.min(Math.max(1, limit ?? DEFAULT_LIMIT), MAX_LIMIT);
+  return scored.slice(0, cap).map((s) => s.match);
 }
 
 // ---- execute ----
@@ -583,10 +614,52 @@ async function configureOAuthRequest(
 
 // ---- list / remove ----
 
-/** JSON summary of every registered API (id, name, kind, base, op count, auth). */
-async function listApisResult(state: ServeState): Promise<string> {
+/**
+ * Tag -> operation-count map for an API's ops, busiest first (untagged ops
+ * bucketed), capped to the `limit` biggest areas. Like the enum/description caps,
+ * this keeps the capability view an overview rather than a second full index; the
+ * dropped count is returned so truncation is never silent.
+ */
+function tagCounts(
+  ops: OperationInfo[],
+  limit: number,
+): { tags: Record<string, number>; truncated: number } {
+  const counts = new Map<string, number>();
+  for (const op of ops) {
+    const tags = op.tags.length ? op.tags : ["(untagged)"];
+    for (const t of tags) counts.set(t, (counts.get(t) ?? 0) + 1);
+  }
+  const sorted = [...counts].sort(
+    (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+  );
+  return {
+    tags: Object.fromEntries(sorted.slice(0, limit)),
+    truncated: Math.max(0, sorted.length - limit),
+  };
+}
+
+/**
+ * JSON summary of registered APIs (id, name, description, kind, base, op count,
+ * auth). With `apiFilter` set, returns just that API and adds its `capabilities`
+ * map (operation tags -> counts) - the heavier territory view, paid only on a
+ * drill-in so the unfiltered inventory stays lean.
+ */
+async function listApisResult(
+  state: ServeState,
+  apiFilter?: string,
+): Promise<{ text: string; isError: boolean }> {
+  const entries = apiFilter
+    ? state.entries.filter((e) => e.id === apiFilter)
+    : state.entries;
+  if (apiFilter && entries.length === 0) {
+    const known = state.entries.map((e) => e.id).join(", ") || "(none)";
+    return {
+      text: `Unknown api "${apiFilter}". Registered ids: ${known}`,
+      isError: true,
+    };
+  }
   const apis: Record<string, unknown>[] = [];
-  for (const e of state.entries) {
+  for (const e of entries) {
     const ops = state.opsById.get(e.id);
     let auth: string = e.auth.kind;
     if (e.auth.kind === "oauth2") {
@@ -603,10 +676,20 @@ async function listApisResult(state: ServeState): Promise<string> {
       operations: ops ? ops.length : null,
       auth,
     };
+    if (e.description) api.description = e.description;
     if (e.docsUrl) api.docsUrl = e.docsUrl;
+    if (apiFilter && ops) {
+      const { tags, truncated } = tagCounts(ops, MAX_CAPABILITY_TAGS);
+      api.capabilities = tags;
+      if (truncated > 0) {
+        api.capabilitiesNote = `showing the ${MAX_CAPABILITY_TAGS} busiest of ${
+          MAX_CAPABILITY_TAGS + truncated
+        } capability areas; search to reach the rest`;
+      }
+    }
     apis.push(api);
   }
-  return JSON.stringify(apis, null, 2);
+  return { text: JSON.stringify(apis), isError: false };
 }
 
 async function removeApiRequest(
@@ -671,12 +754,22 @@ export async function runServe(_args: string[]): Promise<void> {
     );
   }
 
+  // Regeneration above never changes an entry's kind or the registered set, so
+  // the kinds drive the execute description correctly here.
+  const executeDescription = buildExecuteDescription(
+    new Set<ApiKind>(startup.entries.map((e) => e.kind)),
+  );
+
   const server = new McpServer(
     { name: "anyapi-mcp", version: "0.1.0" },
     { instructions: buildInstructions(startup.entries) },
   );
 
-  const searchShape = { query: z.string(), api: z.string().optional() };
+  const searchShape = {
+    query: z.string(),
+    api: z.string().optional(),
+    limit: z.number().int().positive().optional(),
+  };
   type SearchArgs = z.infer<z.ZodObject<typeof searchShape>>;
   server.registerTool(
     "search",
@@ -685,8 +778,8 @@ export async function runServe(_args: string[]): Promise<void> {
       description: SEARCH_DESCRIPTION,
       inputSchema: searchShape,
     },
-    async ({ query, api }: SearchArgs) => {
-      const state = await loadState();
+    async ({ query, api, limit }: SearchArgs) => {
+      const state = await loadStateSynced();
       if (state.entries.length === 0) {
         return {
           content: [{
@@ -696,11 +789,11 @@ export async function runServe(_args: string[]): Promise<void> {
           }],
         };
       }
-      const matches = searchOperations(state, query, api);
+      const matches = searchOperations(state, query, api, limit);
       return {
         content: [{
           type: "text" as const,
-          text: JSON.stringify(matches, null, 2),
+          text: JSON.stringify(matches),
         }],
       };
     },
@@ -720,15 +813,15 @@ export async function runServe(_args: string[]): Promise<void> {
     ),
   };
   type ExecuteArgs = z.infer<z.ZodObject<typeof executeShape>>;
-  server.registerTool(
+  const executeTool = server.registerTool(
     "execute",
     {
       title: "Execute TypeScript against an API",
-      description: EXECUTE_DESCRIPTION,
+      description: executeDescription,
       inputSchema: executeShape,
     },
     async ({ api, code, check, timeoutMs }: ExecuteArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await executeRequest(entries, api, code, {
         check,
         timeoutMs,
@@ -736,6 +829,35 @@ export async function runServe(_args: string[]): Promise<void> {
       return { content: [{ type: "text" as const, text }], isError };
     },
   );
+
+  // The execute description above lists only the client shapes for the kinds
+  // present at startup, but the registry hot-reloads on every tool call: a
+  // mid-session add_api/remove_api (or an external `anyapi-mcp add`) can
+  // introduce or drop a kind. Re-derive the description whenever the loaded
+  // kind-set changes and push a tools/list_changed via update(); loadStateSynced
+  // wraps the per-call registry read so every handler keeps execute current.
+  let executeKinds = [...new Set(startup.entries.map((e) => e.kind))]
+    .sort()
+    .join(",");
+
+  function syncExecuteDescription(entries: RegistryEntry[]): void {
+    const kinds = new Set<ApiKind>(entries.map((e) => e.kind));
+    const key = [...kinds].sort().join(",");
+    if (key === executeKinds) return;
+    executeKinds = key;
+    executeTool.update({ description: buildExecuteDescription(kinds) });
+    console.error(
+      `anyapi-mcp serve: execute description updated for kinds [${
+        key || "none"
+      }].`,
+    );
+  }
+
+  async function loadStateSynced(): Promise<ServeState> {
+    const state = await loadState();
+    syncExecuteDescription(state.entries);
+    return state;
+  }
 
   const authenticateShape = { api: z.string() };
   type AuthenticateArgs = z.infer<z.ZodObject<typeof authenticateShape>>;
@@ -747,7 +869,7 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: authenticateShape,
     },
     async ({ api }: AuthenticateArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await authenticateRequest(entries, api);
       return { content: [{ type: "text" as const, text }], isError };
     },
@@ -777,7 +899,7 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: configureOAuthShape,
     },
     async (args: ConfigureOAuthToolArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await configureOAuthRequest(entries, args);
       return { content: [{ type: "text" as const, text }], isError };
     },
@@ -846,6 +968,10 @@ export async function runServe(_args: string[]): Promise<void> {
           : ` If requests come back 401/403 this API needs a token: run ` +
             `\`anyapi-mcp add ${specSource} --id ${entry.id} --token${kindFlag}\` in a shell so the token ` +
             `is stored in your OS keychain (never through this chat).`;
+        // A new registration may introduce a kind (e.g. the first GraphQL/SOAP
+        // API in an OpenAPI-only session); refresh the execute description so its
+        // client shape is documented immediately.
+        syncExecuteDescription(await readRegistry());
         return { content: [{ type: "text" as const, text: head + authHelp }] };
       } catch (err) {
         return {
@@ -861,18 +987,23 @@ export async function runServe(_args: string[]): Promise<void> {
     },
   );
 
+  const listApisShape = {
+    api: z.string().optional().describe(
+      "Registered API id; when set, returns just that API plus its capability map (operation tags)",
+    ),
+  };
+  type ListApisArgs = z.infer<z.ZodObject<typeof listApisShape>>;
   server.registerTool(
     "list_apis",
     {
       title: "List registered APIs",
       description: LIST_APIS_DESCRIPTION,
-      inputSchema: {},
+      inputSchema: listApisShape,
     },
-    async () => {
-      const state = await loadState();
-      return {
-        content: [{ type: "text" as const, text: await listApisResult(state) }],
-      };
+    async ({ api }: ListApisArgs) => {
+      const state = await loadStateSynced();
+      const { text, isError } = await listApisResult(state, api);
+      return { content: [{ type: "text" as const, text }], isError };
     },
   );
 
@@ -888,8 +1019,10 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: removeApiShape,
     },
     async ({ api }: RemoveApiArgs) => {
-      const { entries } = await loadState();
+      const { entries } = await loadStateSynced();
       const { text, isError } = await removeApiRequest(entries, api);
+      // Removing the last API of a kind drops its client shape from execute.
+      if (!isError) syncExecuteDescription(entries.filter((e) => e.id !== api));
       return { content: [{ type: "text" as const, text }], isError };
     },
   );

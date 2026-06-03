@@ -454,6 +454,12 @@ export function specName(spec: Json): string {
   return (info && str(info.title)) || "API";
 }
 
+/** The spec's info.description, normalized + length-capped; undefined if absent. */
+export function specDescription(spec: Json): string | undefined {
+  const info = obj(spec.info);
+  return info ? clampDescription(str(info.description)) : undefined;
+}
+
 // ---- type generation ----
 
 /** Generate the typed .d.ts via the openapi-typescript CLI into `outPath`. */
@@ -547,8 +553,10 @@ export const openapiAdapter: ProtocolAdapter = {
     const hosts = hostsFromBaseUrl(baseUrl);
     const operations = buildOperationIndex(spec);
     const oauth = discoverOAuth(spec);
+    const description = specDescription(spec);
     return {
       name: specName(spec),
+      ...(description ? { description } : {}),
       baseUrl,
       hosts,
       operations,

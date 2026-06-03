@@ -34,6 +34,7 @@ interface GqlField {
 interface FullType {
   kind: string;
   name: string | null;
+  description?: string | null;
   fields?: GqlField[] | null;
   inputFields?: InputValue[] | null;
   enumValues?: { name: string }[] | null;
@@ -263,8 +264,16 @@ export const graphqlAdapter: ProtocolAdapter = {
     const schema = await introspect(source, opts.token);
     const baseUrl = opts.baseUrlOverride ?? source;
     const operations = buildOperationIndex(schema);
+    // Best-effort: the Query root type's own doc string, when the schema sets one.
+    const rootName = schema.queryType?.name;
+    const description = clampDescription(
+      rootName
+        ? schema.types.find((t) => t.name === rootName)?.description
+        : undefined,
+    );
     return {
       name: new URL(baseUrl).host,
+      ...(description ? { description } : {}),
       baseUrl,
       hosts: [new URL(baseUrl).host],
       operations,

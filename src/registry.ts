@@ -46,6 +46,8 @@ export interface RegistryEntry {
   /** Slug, unique, used on the CLI and in execute. */
   id: string;
   name: string;
+  /** Short human description from the source spec, surfaced by list_apis (optional). */
+  description?: string;
   /** Protocol adapter for this API (defaults to "openapi" for older entries). */
   kind: ApiKind;
   /** URL or absolute local path the source was loaded from. */

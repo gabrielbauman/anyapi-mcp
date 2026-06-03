@@ -267,6 +267,7 @@ export async function registerApi(
     addedAt: new Date().toISOString(),
   };
   if (opts.docsUrl) entry.docsUrl = opts.docsUrl;
+  if (prepared.description) entry.description = prepared.description;
 
   if (existing) {
     // In-place overwrite. The fresh addedAt invalidates serve's ops cache; the
