@@ -2,9 +2,15 @@
 // a compact operation index for search, generate a typed .d.ts via
 // openapi-typescript, and run model code against an openapi-fetch client.
 //
+// Swagger 2.0 (OpenAPI 2.0) specs are converted to OpenAPI 3.0 up front (see
+// maybeConvertSwagger2): openapi-typescript rejects 2.0, and the index code
+// below reads 3.x shapes (`servers`, `requestBody`). Everything downstream then
+// operates on a 3.x document regardless of the source version.
+//
 // The spec is untyped external JSON, so we navigate it with small typed
 // accessors (obj/arr/str) rather than trusting its shape.
 
+import swagger2openapi from "swagger2openapi";
 import { toFileUrl } from "@std/path";
 import { ensureCacheDir } from "./paths.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
@@ -72,6 +78,54 @@ export async function loadSpec(specSource: string): Promise<Json> {
   const spec = obj(parsed);
   if (!spec) throw new Error("Spec did not parse to a JSON object.");
   return spec;
+}
+
+// ---- Swagger 2.0 -> OpenAPI 3.0 ----
+
+/** True for a Swagger 2.0 (OpenAPI 2.0) document, identified by its `swagger` field. */
+function isSwagger2(spec: Json): boolean {
+  const version = spec.swagger;
+  return typeof version === "string" && version.startsWith("2");
+}
+
+/**
+ * If `spec` is Swagger 2.0, convert it to an OpenAPI 3.0 document; otherwise
+ * return undefined so the caller keeps the original 3.x spec. openapi-typescript
+ * and the 3.x-shaped index code below don't understand 2.0, so this is the one
+ * place that bridges the version gap.
+ */
+async function maybeConvertSwagger2(
+  spec: Json,
+  source: string,
+  log: (message: string) => void,
+): Promise<Json | undefined> {
+  if (!isSwagger2(spec)) return undefined;
+  log("Detected Swagger 2.0; converting to OpenAPI 3.0 ...");
+  let openapi: unknown;
+  try {
+    const result = await swagger2openapi.convertObj(spec, {
+      patch: true, // auto-fix minor spec errors instead of aborting
+      warnOnly: true, // tolerate non-fatal validation issues
+      // Inline external $refs (resolved relative to `source`) during conversion
+      // so the converted document is self-contained. generateTypesFromSpec then
+      // writes it to a temp file whose directory can't affect ref resolution -
+      // which matters for multi-file local specs and relative refs in remote ones.
+      resolve: true,
+      source,
+    });
+    openapi = result?.openapi;
+  } catch (err) {
+    throw new Error(
+      `Failed to convert Swagger 2.0 spec to OpenAPI 3.0: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  const converted = obj(openapi);
+  if (!converted) {
+    throw new Error("Swagger 2.0 conversion produced no OpenAPI 3.0 document.");
+  }
+  return converted;
 }
 
 // ---- local $ref resolution (#/...) ----
@@ -271,6 +325,29 @@ async function generateTypes(
   }
 }
 
+/**
+ * Generate types from an in-memory (converted) spec. openapi-typescript reads a
+ * path or URL, so the spec is materialized to a temp file solely for the CLI run
+ * and removed afterward. The spec is self-contained (maybeConvertSwagger2 already
+ * inlined external $refs), so the temp directory has no bearing on resolution.
+ */
+async function generateTypesFromSpec(
+  spec: Json,
+  outPath: string,
+): Promise<void> {
+  await ensureCacheDir();
+  const specFile = await Deno.makeTempFile({
+    prefix: "anyapi-openapi3-",
+    suffix: ".json",
+  });
+  try {
+    await Deno.writeTextFile(specFile, JSON.stringify(spec));
+    await generateTypes(specFile, outPath);
+  } finally {
+    await Deno.remove(specFile).catch(() => {});
+  }
+}
+
 // ---- adapter ----
 
 export const openapiAdapter: ProtocolAdapter = {
@@ -279,7 +356,11 @@ export const openapiAdapter: ProtocolAdapter = {
   async prepare(source, opts) {
     const log = opts.onProgress ?? (() => {});
     log(`Loading spec from ${source} ...`);
-    const spec = await loadSpec(source);
+    const loaded = await loadSpec(source);
+    // Swagger 2.0 sources are normalized to OpenAPI 3.0 here; `converted` is
+    // undefined for specs that were already 3.x.
+    const converted = await maybeConvertSwagger2(loaded, source, log);
+    const spec = converted ?? loaded;
     const baseUrl = opts.baseUrlOverride ?? resolveBaseUrl(spec, source);
     const hosts = hostsFromBaseUrl(baseUrl);
     const operations = buildOperationIndex(spec);
@@ -288,7 +369,12 @@ export const openapiAdapter: ProtocolAdapter = {
       baseUrl,
       hosts,
       operations,
-      writeTypes: (outPath: string) => generateTypes(source, outPath),
+      // openapi-typescript can't read the original Swagger 2.0 `source`, so a
+      // converted spec is fed to it as OpenAPI 3.0 instead.
+      writeTypes: (outPath: string) =>
+        converted
+          ? generateTypesFromSpec(converted, outPath)
+          : generateTypes(source, outPath),
     };
   },
 
