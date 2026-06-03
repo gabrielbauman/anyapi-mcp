@@ -7,7 +7,7 @@ drives by writing code. See [README.md](README.md) for the user-facing pitch.
 ## Commands
 
 ```sh
-deno task dev <subcommand>   # run from source (add | list | login | logout | remove | serve | install)
+deno task dev <subcommand>   # run from source (add | list | regenerate | login | logout | remove | serve | install)
 deno task compile            # build the self-contained ./anyapi-mcp binary
 deno task check              # type-check (deno check src/main.ts)
 deno task lint               # deno lint src/
@@ -26,11 +26,13 @@ The core (registry, search, execute sandbox) is **protocol-agnostic**; each
 protocol plugs in through one in-tree adapter object.
 
 - `src/main.ts`: argv dispatch to the subcommands.
-- `src/commands/{add,install,list,login,logout,remove,serve}.ts`: one file per
-  subcommand. `serve.ts` is the MCP server exposing `search`, `execute`,
-  `authenticate`, `configure_oauth`, `add_api`, `list_apis`, `remove_api`;
-  `install.ts` registers anyapi-mcp with Claude Code / Desktop; `login`/`logout`
-  manage OAuth sessions.
+- `src/commands/{add,install,list,regenerate,login,logout,remove,serve}.ts`: one
+  file per subcommand. `serve.ts` is the MCP server exposing `search`,
+  `execute`, `authenticate`, `configure_oauth`, `add_api`, `list_apis`,
+  `remove_api`; `install.ts` registers anyapi-mcp with Claude Code / Desktop;
+  `login`/`logout` manage OAuth sessions; `regenerate.ts` rebuilds generated
+  code from saved sources (credentials untouched) — and `serve` runs the same
+  pass on stale entries at startup (see `register.ts`).
 - `src/adapter.ts`: the `ProtocolAdapter` seam. `prepare()` turns a source into
   base URL + hosts + operation index + generated client types (+ optional
   discovered OAuth config); `buildHarness()` builds the `execute` preamble that
@@ -68,7 +70,13 @@ protocol plugs in through one in-tree adapter object.
   upserts in place (fresh `addedAt` invalidates serve's ops cache; same-id
   keystore accounts are preserved, so an OAuth API stays logged in across a
   re-register). `unregisterApi` (shared by `remove` and `remove_api`) deletes
-  the entry, its secrets, and its cached artifacts.
+  the entry, its secrets, and its cached artifacts. `regenerateApi`/
+  `regenerateApis` re-run only codegen (re-fetch source → rewrite types + ops,
+  bump `addedAt`) while preserving the entry's auth/baseUrl/hosts — no secret is
+  written or deleted (a bearer token is only read, to re-introspect). Each
+  generated artifact is stamped with `CODEGEN_VERSION`; bump that constant when
+  a generator change makes old artifacts stale, and `serve` regenerates anything
+  older on startup (an entry missing the stamp counts as stale).
 - `src/operation.ts`: operation index + keyword `search` (no embeddings). Params
   carry optional `description`/`enum`, surfaced in search (`clampDescription`/
   `applyEnum` bound their size; `enum` holds only real values — an over-cap

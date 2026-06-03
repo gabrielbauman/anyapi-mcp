@@ -58,6 +58,13 @@ export interface RegistryEntry {
   auth: Auth;
   /** Absolute path to the generated .d.ts in the cache dir. */
   typesPath: string;
+  /**
+   * The `CODEGEN_VERSION` the cached artifacts (types + ops index) were built
+   * under. Absent on entries written before this field existed; a missing or
+   * older value is treated as stale, so `serve` regenerates it on startup (and
+   * `anyapi-mcp regenerate` rebuilds on demand). See register.ts.
+   */
+  codegenVersion?: number;
   addedAt: string;
 }
 

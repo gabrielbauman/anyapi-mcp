@@ -10,12 +10,13 @@ import {
   type Auth,
   findEntry,
   type OAuth2Auth,
+  readRegistry,
   type RegistryEntry,
   removeEntry,
   updateEntry,
 } from "./registry.ts";
 import { writeOpsIndex } from "./operation.ts";
-import { deleteSecret, setSecret } from "./keystore.ts";
+import { deleteSecret, getSecret, setSecret } from "./keystore.ts";
 import { opsPathFor, typesPathFor } from "./paths.ts";
 import {
   clearOAuthSecrets,
@@ -23,6 +24,20 @@ import {
   type DiscoveredOAuth,
   quirkForAuthUrl,
 } from "./oauth.ts";
+
+/**
+ * Version of the generated-code contract. Bump this whenever a change would make
+ * previously-generated artifacts stale relative to the current build: the
+ * openapi-typescript output or its post-processing (openapi-sanitize.ts), the
+ * GraphQL/SOAP type/client emitters, the SOAP runtime deps baked into the client
+ * module, or the operation-index shape (operation.ts). Each registry entry
+ * records the version its artifacts were built under; `serve` regenerates any
+ * stale entry on startup and `anyapi-mcp regenerate` rebuilds on demand.
+ *
+ * It is a deliberate counter, not the git hash: tying regeneration to commits
+ * would re-fetch every spec on releases that never touched codegen.
+ */
+export const CODEGEN_VERSION = 1;
 
 /**
  * Build a reverse-DNS id from a base URL: the host reversed, then the base-path
@@ -248,6 +263,7 @@ export async function registerApi(
     hosts,
     auth,
     typesPath,
+    codegenVersion: CODEGEN_VERSION,
     addedAt: new Date().toISOString(),
   };
   if (opts.docsUrl) entry.docsUrl = opts.docsUrl;
@@ -276,4 +292,101 @@ export async function registerApi(
     operationCount: prepared.operations.length,
     overwritten: existing !== undefined,
   };
+}
+
+export interface RegenerateResult {
+  id: string;
+  /** True when the code was rebuilt, or (with `skipped`) was already current. */
+  ok: boolean;
+  /** Operation count on the refreshed source (present on a successful rebuild). */
+  operationCount?: number;
+  /** Set when `staleOnly` skipped an entry already at CODEGEN_VERSION. */
+  skipped?: boolean;
+  /** Failure reason (present when `ok` is false). */
+  error?: string;
+}
+
+/**
+ * Rebuild ONLY the generated code for an already-registered API: re-fetch its
+ * source, regenerate the typed client + operation index in place, and bump the
+ * entry's `codegenVersion` and `addedAt` (the latter busts serve's ops cache).
+ *
+ * The entry's auth, baseUrl, and hosts are preserved verbatim - this is a codegen
+ * refresh, not a re-registration. No secret is written or deleted; a bearer token
+ * is only READ, to re-inspect a source that needs auth (e.g. GraphQL
+ * introspection). On any failure the existing artifacts are left in place and the
+ * error is returned, never thrown - a stale-but-working client beats a broken one.
+ */
+export async function regenerateApi(
+  entry: RegistryEntry,
+  onProgress?: (message: string) => void,
+): Promise<RegenerateResult> {
+  const log = onProgress ?? (() => {});
+  try {
+    const adapter = getAdapter(entry.kind);
+    const token = entry.auth.kind === "bearer"
+      ? await getSecret(entry.auth.tokenKey)
+      : undefined;
+    const prepared = await adapter.prepare(entry.specSource, {
+      // Pin the registered base URL so a codegen refresh never moves the base or
+      // re-derives the host allowlist - that is a re-registration concern.
+      baseUrlOverride: entry.baseUrl,
+      token,
+      onProgress: log,
+    });
+    await prepared.writeTypes(entry.typesPath);
+    await writeOpsIndex(entry.id, prepared.operations);
+    const updated: RegistryEntry = {
+      ...entry,
+      codegenVersion: CODEGEN_VERSION,
+      addedAt: new Date().toISOString(),
+    };
+    if (!(await updateEntry(updated))) {
+      return { id: entry.id, ok: false, error: "no longer registered" };
+    }
+    return {
+      id: entry.id,
+      ok: true,
+      operationCount: prepared.operations.length,
+    };
+  } catch (err) {
+    return {
+      id: entry.id,
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Regenerate code for many registered APIs. With `ids`, only those entries are
+ * considered; otherwise every registered API. With `staleOnly`, entries already
+ * at CODEGEN_VERSION are skipped (serve's post-upgrade startup pass uses this).
+ * Each API is independent - one failure never aborts the rest.
+ */
+export async function regenerateApis(
+  opts: {
+    ids?: string[];
+    staleOnly?: boolean;
+    onProgress?: (message: string) => void;
+  } = {},
+): Promise<RegenerateResult[]> {
+  const log = opts.onProgress ?? (() => {});
+  let entries = await readRegistry();
+  if (opts.ids) {
+    const want = new Set(opts.ids);
+    entries = entries.filter((e) => want.has(e.id));
+  }
+  const results: RegenerateResult[] = [];
+  for (const entry of entries) {
+    if (opts.staleOnly && entry.codegenVersion === CODEGEN_VERSION) {
+      results.push({ id: entry.id, ok: true, skipped: true });
+      continue;
+    }
+    log(
+      `Regenerating ${entry.id} (${entry.kind}) from ${entry.specSource} ...`,
+    );
+    results.push(await regenerateApi(entry, log));
+  }
+  return results;
 }
