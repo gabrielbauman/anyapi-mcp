@@ -21,6 +21,8 @@ export interface PrepareOptions {
 
 export interface PreparedApi {
   name: string;
+  /** Short human description of the API (from the source), surfaced by list_apis. */
+  description?: string;
   baseUrl: string;
   hosts: string[];
   operations: OperationInfo[];
