@@ -14,6 +14,7 @@ import swagger2openapi from "swagger2openapi";
 import { parse as parseYaml } from "@std/yaml";
 import { toFileUrl } from "@std/path";
 import { ensureCacheDir } from "./paths.ts";
+import { sanitizeRecursiveSchemaAliases } from "./openapi-sanitize.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
 import { applyEnum, clampDescription } from "./operation.ts";
 import type { OperationInfo, OperationParam } from "./operation.ts";
@@ -459,6 +460,7 @@ export function specName(spec: Json): string {
 async function generateTypes(
   specSource: string,
   outPath: string,
+  log: (message: string) => void = () => {},
 ): Promise<void> {
   await ensureCacheDir();
   const command = new Deno.Command("deno", {
@@ -481,6 +483,27 @@ async function generateTypes(
       }`,
     );
   }
+  await sanitizeTypes(outPath, log);
+}
+
+/**
+ * Rewrite self-referential schema aliases in the generated .d.ts so a single
+ * recursive "arbitrary JSON" schema (or a $ref cycle) can't fail the whole-program
+ * type check that `execute` runs (TS2502). No-op for specs without such a cycle.
+ */
+async function sanitizeTypes(
+  outPath: string,
+  log: (message: string) => void,
+): Promise<void> {
+  const original = await Deno.readTextFile(outPath);
+  const { text, lifted } = sanitizeRecursiveSchemaAliases(original);
+  if (lifted === 0) return;
+  await Deno.writeTextFile(outPath, text);
+  log(
+    `Rewrote ${lifted} self-referential schema type${
+      lifted === 1 ? "" : "s"
+    } so type-checked execute keeps working.`,
+  );
 }
 
 /**
@@ -492,6 +515,7 @@ async function generateTypes(
 async function generateTypesFromSpec(
   spec: Json,
   outPath: string,
+  log: (message: string) => void = () => {},
 ): Promise<void> {
   await ensureCacheDir();
   const specFile = await Deno.makeTempFile({
@@ -500,7 +524,7 @@ async function generateTypesFromSpec(
   });
   try {
     await Deno.writeTextFile(specFile, JSON.stringify(spec));
-    await generateTypes(specFile, outPath);
+    await generateTypes(specFile, outPath, log);
   } finally {
     await Deno.remove(specFile).catch(() => {});
   }
@@ -533,8 +557,8 @@ export const openapiAdapter: ProtocolAdapter = {
       // converted spec is fed to it as OpenAPI 3.0 instead.
       writeTypes: (outPath: string) =>
         converted
-          ? generateTypesFromSpec(converted, outPath)
-          : generateTypes(source, outPath),
+          ? generateTypesFromSpec(converted, outPath, log)
+          : generateTypes(source, outPath, log),
     };
   },
 
