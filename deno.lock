@@ -6,6 +6,7 @@
     "jsr:@std/fs@^1.0.24": "1.0.24",
     "jsr:@std/internal@^1.0.14": "1.0.14",
     "jsr:@std/path@^1.1.5": "1.1.5",
+    "jsr:@std/yaml@^1.1.1": "1.1.1",
     "npm:@modelcontextprotocol/sdk@1.29.0": "1.29.0_zod@4.4.3",
     "npm:fast-xml-parser@*": "4.5.6",
     "npm:fast-xml-parser@^4.5.6": "4.5.6",
@@ -40,6 +41,9 @@
       "dependencies": [
         "jsr:@std/internal"
       ]
+    },
+    "@std/yaml@1.1.1": {
+      "integrity": "a57665ecf3d17b926380593a56625d8a10cc7281802f1e993b5ebc94a48e71f8"
     }
   },
   "npm": {
@@ -933,6 +937,7 @@
       "jsr:@std/cli@^1.0.30",
       "jsr:@std/fs@^1.0.24",
       "jsr:@std/path@^1.1.5",
+      "jsr:@std/yaml@^1.1.1",
       "npm:@modelcontextprotocol/sdk@1.29.0",
       "npm:fast-xml-parser@^4.5.6",
       "npm:swagger2openapi@7.0.8",

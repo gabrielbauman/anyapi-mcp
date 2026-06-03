@@ -245,11 +245,11 @@ builds the envelope and parses the response for you.
 - **SOAP scope**: WSDL 1.1, SOAP 1.1/1.2, document/literal, public WSDL → live
   service. Not covered: rpc/encoded, WS-Security / SOAP headers, MTOM, external
   XSD imports, WSDL 2.0.
-- **v1 scope**: JSON OpenAPI specs - OpenAPI 3.x, or Swagger 2.0 auto-converted
-  to 3.0 (convert YAML to JSON first) - plus GraphQL endpoints and SOAP/WSDL
-  services; bearer / no auth. `search` is keyword-based over the operation
-  index - no embeddings or freeform-doc search. Each `execute` is a fresh
-  subprocess (no persistent state between calls).
+- **v1 scope**: OpenAPI specs in JSON or YAML - OpenAPI 3.x, or Swagger 2.0
+  auto-converted to 3.0 - plus GraphQL endpoints and SOAP/WSDL services; bearer
+  / no auth. `search` is keyword-based over the operation index - no embeddings
+  or freeform-doc search. Each `execute` is a fresh subprocess (no persistent
+  state between calls).
 
 ## Development
 

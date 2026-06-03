@@ -1,5 +1,5 @@
-// OpenAPI protocol adapter: load a JSON spec, derive its base URL + hosts, build
-// a compact operation index for search, generate a typed .d.ts via
+// OpenAPI protocol adapter: load a JSON or YAML spec, derive its base URL +
+// hosts, build a compact operation index for search, generate a typed .d.ts via
 // openapi-typescript, and run model code against an openapi-fetch client.
 //
 // Swagger 2.0 (OpenAPI 2.0) specs are converted to OpenAPI 3.0 up front (see
@@ -7,10 +7,11 @@
 // below reads 3.x shapes (`servers`, `requestBody`). Everything downstream then
 // operates on a 3.x document regardless of the source version.
 //
-// The spec is untyped external JSON, so we navigate it with small typed
-// accessors (obj/arr/str) rather than trusting its shape.
+// The parsed spec is an untyped external document, so we navigate it with small
+// typed accessors (obj/arr/str) rather than trusting its shape.
 
 import swagger2openapi from "swagger2openapi";
+import { parse as parseYaml } from "@std/yaml";
 import { toFileUrl } from "@std/path";
 import { ensureCacheDir } from "./paths.ts";
 import type { ProtocolAdapter } from "./adapter.ts";
@@ -54,7 +55,31 @@ function stripTrailingSlash(s: string): string {
   return s.length > 1 ? s.replace(/\/+$/, "") : s;
 }
 
-/** Load + JSON-parse a spec from a URL or a local path. */
+/**
+ * Parse spec text as JSON, falling back to YAML. JSON is tried first so JSON
+ * specs keep exact JSON semantics (and skip the slower YAML path); a YAML spec
+ * fails the JSON parse and is then parsed as YAML. This parse only feeds the
+ * operation index and base-URL derivation below; type generation is handled
+ * separately by openapi-typescript, which parses YAML or JSON itself.
+ */
+function parseSpec(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    // Not JSON; fall through to YAML.
+  }
+  try {
+    return parseYaml(text);
+  } catch (err) {
+    throw new Error(
+      `Spec is not valid JSON or YAML: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+/** Load a spec from a URL or a local path, parsing it as JSON or YAML. */
 export async function loadSpec(specSource: string): Promise<Json> {
   let text: string;
   if (isUrl(specSource)) {
@@ -66,17 +91,8 @@ export async function loadSpec(specSource: string): Promise<Json> {
   } else {
     text = await Deno.readTextFile(specSource);
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error(
-      "Spec is not valid JSON. anyapi-mcp v1 supports JSON OpenAPI specs; " +
-        "convert a YAML spec to JSON first.",
-    );
-  }
-  const spec = obj(parsed);
-  if (!spec) throw new Error("Spec did not parse to a JSON object.");
+  const spec = obj(parseSpec(text));
+  if (!spec) throw new Error("Spec did not parse to an object.");
   return spec;
 }
 
