@@ -2,6 +2,7 @@
 
 import { readRegistry } from "../registry.ts";
 import { readOpsIndex } from "../operation.ts";
+import { describeExpiry, loadToken } from "../oauth.ts";
 
 export async function runList(_args: string[]): Promise<void> {
   const entries = await readRegistry();
@@ -15,9 +16,20 @@ export async function runList(_args: string[]): Promise<void> {
   for (const e of entries) {
     const ops = await readOpsIndex(e.id);
     const count = ops ? String(ops.length) : "?";
+    // For OAuth, surface live login/expiry status (one keystore lookup per entry).
+    let authText: string = e.auth.kind;
+    let loginHint = false;
+    if (e.auth.kind === "oauth2") {
+      const token = await loadToken(e.auth);
+      authText = token
+        ? `oauth2 (logged in, ${describeExpiry(token)})`
+        : "oauth2 (not logged in)";
+      loginHint = !token;
+    }
     console.log(`${e.id}  -  ${e.name}`);
     console.log(`  base URL: ${e.baseUrl}`);
-    console.log(`  kind: ${e.kind}   ops: ${count}   auth: ${e.auth.kind}`);
+    console.log(`  kind: ${e.kind}   ops: ${count}   auth: ${authText}`);
+    if (loginHint) console.log(`  -> run: anyapi-mcp login ${e.id}`);
     if (e.docsUrl) console.log(`  docs: ${e.docsUrl}`);
     console.log("");
   }

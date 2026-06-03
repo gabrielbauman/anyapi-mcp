@@ -9,11 +9,17 @@ import {
   appendEntry,
   type Auth,
   findEntry,
+  type OAuth2Auth,
   type RegistryEntry,
 } from "./registry.ts";
 import { writeOpsIndex } from "./operation.ts";
 import { setSecret } from "./keystore.ts";
 import { typesPathFor } from "./paths.ts";
+import {
+  defaultRedirectUri,
+  type DiscoveredOAuth,
+  quirkForAuthUrl,
+} from "./oauth.ts";
 
 /**
  * Build a reverse-DNS id from a base URL: the host reversed, then the base-path
@@ -49,8 +55,52 @@ export interface RegisterOptions {
   docsUrl?: string;
   /** If provided, stored in the keystore and the entry becomes bearer auth. */
   token?: string;
+  /** Force OAuth2 even when discovery finds nothing (manual setup). */
+  oauth?: boolean;
+  /** Override/supply the OAuth authorize + token endpoints (else discovered). */
+  authUrl?: string;
+  tokenUrl?: string;
+  /** Scopes to request at login (else the source's advertised scopes). */
+  scopes?: string[];
+  /** Override the scope separator (RFC 6749 " "; some providers use ","). */
+  scopeSeparator?: string;
+  /** Register with no auth even if OAuth was discovered. */
+  noAuth?: boolean;
   /** Optional progress sink (the CLI passes console.error; the MCP tool omits it). */
   onProgress?: (message: string) => void;
+}
+
+/**
+ * Resolve the OAuth config to store, given discovered values and explicit
+ * overrides. Precedence: explicit flag > known-provider quirk > discovered. The
+ * quirk is looked up by the effective authorize host - an explicit --auth-url if
+ * given, otherwise the spec's - so a spec with the right host but wrong paths
+ * (Strava) still gets corrected.
+ */
+function resolveOAuth(
+  id: string,
+  discovered: DiscoveredOAuth | undefined,
+  opts: RegisterOptions,
+): OAuth2Auth {
+  const baseAuthUrl = opts.authUrl ?? discovered?.authorizationUrl;
+  const baseTokenUrl = opts.tokenUrl ?? discovered?.tokenUrl;
+  if (!baseAuthUrl || !baseTokenUrl) {
+    throw new Error(
+      "OAuth requested but no authorization/token URL was found; pass --auth-url and --token-url.",
+    );
+  }
+  const quirk = quirkForAuthUrl(baseAuthUrl);
+  return {
+    kind: "oauth2",
+    header: "Authorization",
+    authorizationUrl: opts.authUrl ?? quirk?.authorizationUrl ?? baseAuthUrl,
+    tokenUrl: opts.tokenUrl ?? quirk?.tokenUrl ?? baseTokenUrl,
+    scopes: opts.scopes ?? discovered?.scopes ?? [],
+    scopeSeparator: opts.scopeSeparator ?? quirk?.scopeSeparator ?? " ",
+    redirectUri: defaultRedirectUri(),
+    clientKey: `anyapi-mcp:${id}:client`,
+    tokenKey: `anyapi-mcp:${id}:oauth`,
+  };
 }
 
 export interface RegisterResult {
@@ -98,11 +148,19 @@ export async function registerApi(
   await prepared.writeTypes(typesPath);
   await writeOpsIndex(id, prepared.operations);
 
+  // Auth precedence: an explicit --token wins (bearer); --no-auth forces none;
+  // otherwise OAuth is adopted when discovered or explicitly requested. The
+  // browser login happens later via `anyapi-mcp login` - registration only
+  // records the (unauthenticated) OAuth config.
   let auth: Auth = { kind: "none" };
   if (opts.token !== undefined) {
     const tokenKey = `anyapi-mcp:${id}`;
     await setSecret(tokenKey, opts.token);
     auth = { kind: "bearer", header: "Authorization", tokenKey };
+  } else if (!opts.noAuth) {
+    const wantOAuth = opts.oauth || prepared.oauth !== undefined ||
+      (opts.authUrl !== undefined && opts.tokenUrl !== undefined);
+    if (wantOAuth) auth = resolveOAuth(id, prepared.oauth, opts);
   }
 
   const entry: RegistryEntry = {

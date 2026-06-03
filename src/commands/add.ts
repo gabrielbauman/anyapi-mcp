@@ -22,8 +22,16 @@ Options:
   --base-url <url>   Override the base URL derived from the source
   --docs <url>       Documentation URL to store and surface (not parsed)
   --token            Store a bearer token (read without echo, or piped via stdin)
-  --no-auth          Register without authentication (default)
-  -h, --help         Show this help`;
+  --oauth            Treat this API as OAuth 2.0 even if the spec doesn't declare it
+  --auth-url <url>   OAuth authorize endpoint (overrides the spec's value)
+  --token-url <url>  OAuth token endpoint (overrides the spec's value)
+  --scope <name>     Scope to request at login (repeatable; default: the spec's scopes)
+  --scope-separator <sep>  Scope separator in the authorize URL (default " "; Strava uses ",")
+  --no-auth          Register without authentication
+  -h, --help         Show this help
+
+OpenAPI specs that declare an OAuth2 authorization-code flow are detected
+automatically; after adding, run \`anyapi-mcp login <id>\` to authenticate.`;
 
 /** Read a token without echo from a TTY, or from piped stdin in non-interactive use. */
 async function readToken(): Promise<string> {
@@ -35,8 +43,19 @@ async function readToken(): Promise<string> {
 
 export async function runAdd(args: string[]): Promise<void> {
   const flags = parseArgs(args, {
-    string: ["id", "name", "base-url", "docs", "kind"],
-    boolean: ["help", "no-auth", "token"],
+    string: [
+      "id",
+      "name",
+      "base-url",
+      "docs",
+      "kind",
+      "auth-url",
+      "token-url",
+      "scope",
+      "scope-separator",
+    ],
+    collect: ["scope"],
+    boolean: ["help", "no-auth", "token", "oauth"],
     alias: { h: "help" },
   });
 
@@ -57,6 +76,12 @@ export async function runAdd(args: string[]): Promise<void> {
     );
     Deno.exit(1);
   }
+  if (flags.token && (flags.oauth || flags["auth-url"] || flags["token-url"])) {
+    console.error(
+      "anyapi-mcp add: --token (bearer) and the OAuth flags are mutually exclusive.",
+    );
+    Deno.exit(1);
+  }
 
   const specSource = isUrl(rawSource) ? rawSource : resolve(rawSource);
 
@@ -70,6 +95,7 @@ export async function runAdd(args: string[]): Promise<void> {
     }
   }
 
+  const scopes = (flags.scope as string[] | undefined) ?? [];
   try {
     const { entry, operationCount } = await registerApi({
       specSource,
@@ -79,19 +105,43 @@ export async function runAdd(args: string[]): Promise<void> {
       baseUrl: flags["base-url"],
       docsUrl: flags.docs,
       token,
+      oauth: flags.oauth,
+      authUrl: flags["auth-url"],
+      tokenUrl: flags["token-url"],
+      scopes: scopes.length ? scopes : undefined,
+      scopeSeparator: flags["scope-separator"],
+      noAuth: flags["no-auth"],
       onProgress: (m) => console.error(m),
     });
+    const authLine = entry.auth.kind === "bearer"
+      ? `bearer (${entry.auth.tokenKey})`
+      : entry.auth.kind === "oauth2"
+      ? `oauth2 (not logged in)`
+      : entry.auth.kind;
     console.error(
       `Registered "${entry.id}" (${entry.name})\n` +
         `  kind:     ${entry.kind}\n` +
         `  base URL: ${entry.baseUrl}\n` +
         `  hosts:    ${entry.hosts.join(", ")}\n` +
         `  ops:      ${operationCount}\n` +
-        `  auth:     ${entry.auth.kind}${
-          entry.auth.kind === "bearer" ? ` (${entry.auth.tokenKey})` : ""
-        }\n` +
+        `  auth:     ${authLine}\n` +
         `  types:    ${entry.typesPath}`,
     );
+    if (entry.auth.kind === "oauth2") {
+      const scopeList = entry.auth.scopes.length
+        ? entry.auth.scopes.join(", ")
+        : "(none discovered; pass --scope at login)";
+      console.error(
+        `\nThis API uses OAuth 2.0. To authenticate:\n` +
+          `  1. Create an OAuth app with the provider${
+            entry.docsUrl ? ` (see ${entry.docsUrl})` : ""
+          } and set its\n` +
+          `     redirect/callback URL to: ${entry.auth.redirectUri}\n` +
+          `  2. Run: anyapi-mcp login ${entry.id} --client-id <id> --client-secret <secret>\n` +
+          `  authorize: ${entry.auth.authorizationUrl}\n` +
+          `  scopes:    ${scopeList}`,
+      );
+    }
   } catch (err) {
     console.error(
       `anyapi-mcp add: ${err instanceof Error ? err.message : String(err)}`,

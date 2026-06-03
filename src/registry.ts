@@ -1,13 +1,43 @@
 // The API registry: one JSON object per line in apis.jsonl.
 //
 // Secrets are NEVER stored here. For bearer auth we store only `tokenKey`, the
-// keystore account name under which the secret lives.
+// keystore account name under which the secret lives. For OAuth we likewise store
+// only the keystore account names (`clientKey`, `tokenKey`) - the client secret,
+// access token, and refresh token all live in the keystore (see src/oauth.ts).
 
 import { ensureConfigDir, registryPath } from "./paths.ts";
 
+/**
+ * OAuth 2.0 authorization-code config for an API. Holds everything needed to run
+ * the browser login and to refresh tokens, but NO secrets: the client
+ * credentials and token bundle live in the keystore under `clientKey`/`tokenKey`.
+ */
+export interface OAuth2Auth {
+  kind: "oauth2";
+  /** Header the access token is injected into (default "Authorization"). */
+  header: string;
+  /** Provider authorize endpoint (the page the user's browser is sent to). */
+  authorizationUrl: string;
+  /** Provider token endpoint (code exchange + refresh). */
+  tokenUrl: string;
+  /** Scopes requested at login. Mutable: `login` writes the chosen set here. */
+  scopes: string[];
+  /** Separator for the scope param. RFC 6749 uses " "; some providers (Strava) use ",". */
+  scopeSeparator: string;
+  /** redirect_uri the local callback server listens on; must be registered with the provider. */
+  redirectUri: string;
+  /** Extra fixed params appended to the authorize URL (e.g. Google's access_type=offline). */
+  extraAuthParams?: Record<string, string>;
+  /** Keystore account holding the JSON OAuthClient (clientId + clientSecret). */
+  clientKey: string;
+  /** Keystore account holding the JSON OAuthToken bundle (access/refresh/expiry). */
+  tokenKey: string;
+}
+
 export type Auth =
   | { kind: "none" }
-  | { kind: "bearer"; header: string; tokenKey: string };
+  | { kind: "bearer"; header: string; tokenKey: string }
+  | OAuth2Auth;
 
 /** Which protocol adapter handles this API. */
 export type ApiKind = "openapi" | "graphql" | "soap";
@@ -72,13 +102,43 @@ export async function appendEntry(entry: RegistryEntry): Promise<void> {
   });
 }
 
+/**
+ * Atomically rewrite the whole registry: write a temp file in the same directory
+ * and rename it over the target, so an interrupted write can't truncate or
+ * corrupt the registry (rename is atomic within a filesystem).
+ */
+async function writeRegistry(entries: RegistryEntry[]): Promise<void> {
+  const dir = await ensureConfigDir();
+  const body = entries.map((e) => JSON.stringify(e)).join("\n");
+  const tmp = await Deno.makeTempFile({
+    dir,
+    prefix: "apis.",
+    suffix: ".jsonl.tmp",
+  });
+  try {
+    await Deno.writeTextFile(tmp, body.length ? body + "\n" : "");
+    await Deno.rename(tmp, registryPath());
+  } catch (err) {
+    await Deno.remove(tmp).catch(() => {});
+    throw err;
+  }
+}
+
+/** Replace the entry with the same id. Returns false if no entry matched. */
+export async function updateEntry(entry: RegistryEntry): Promise<boolean> {
+  const entries = await readRegistry();
+  const idx = entries.findIndex((e) => e.id === entry.id);
+  if (idx === -1) return false;
+  entries[idx] = entry;
+  await writeRegistry(entries);
+  return true;
+}
+
 /** Rewrite the registry without the entry for `id`. Returns true if one was removed. */
 export async function removeEntry(id: string): Promise<boolean> {
   const entries = await readRegistry();
   const kept = entries.filter((e) => e.id !== id);
   if (kept.length === entries.length) return false;
-  const body = kept.map((e) => JSON.stringify(e)).join("\n");
-  await ensureConfigDir();
-  await Deno.writeTextFile(registryPath(), body.length ? body + "\n" : "");
+  await writeRegistry(kept);
   return true;
 }
