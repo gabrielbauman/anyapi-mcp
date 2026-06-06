@@ -4,11 +4,13 @@ import type { ProtocolAdapter } from "./adapter.ts";
 import { openapiAdapter } from "./openapi.ts";
 import { graphqlAdapter } from "./graphql.ts";
 import { soapAdapter } from "./soap.ts";
+import { atprotoAdapter } from "./atproto.ts";
 
 const ADAPTERS: Record<string, ProtocolAdapter> = {
   openapi: openapiAdapter,
   graphql: graphqlAdapter,
   soap: soapAdapter,
+  atproto: atprotoAdapter,
 };
 
 /** Adapter kinds that can be registered, e.g. for CLI help and validation. */

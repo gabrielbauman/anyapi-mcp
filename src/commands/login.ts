@@ -9,7 +9,7 @@
 
 import { parseArgs } from "@std/cli/parse-args";
 import { promptSecret } from "@std/cli/prompt-secret";
-import { findEntry, updateEntry } from "../registry.ts";
+import { findEntry, type RegistryEntry, updateEntry } from "../registry.ts";
 import {
   defaultRedirectUri,
   describeExpiry,
@@ -19,13 +19,19 @@ import {
   saveClient,
   saveToken,
 } from "../oauth.ts";
+import { loginWithAppPassword } from "../atproto-auth.ts";
 
-const HELP = `anyapi-mcp login - authenticate an OAuth 2.0 API in the browser
+const HELP =
+  `anyapi-mcp login - authenticate an API: OAuth (browser) or atproto (app password)
 
 Usage:
   anyapi-mcp login <id> [options]
 
+For an atproto API, this stores an app password instead:
+  anyapi-mcp login <id> [--identifier <handle>]   (app password read without echo, or piped via stdin)
+
 Options:
+  --identifier <handle>     atproto: account handle/email to authenticate as (if not set at add time)
   --client-id <id>          OAuth app client id (required on first login)
   --client-secret <secret>  Client secret (omit to be prompted without echo; or pipe via stdin)
   --scope <name>            Scope to request (repeatable; default: the API's configured scopes)
@@ -53,9 +59,74 @@ async function readClientSecret(): Promise<string | undefined> {
   return value === "" ? undefined : value;
 }
 
+/** Read an app password without echo (TTY) or from piped stdin. */
+async function readAppPassword(): Promise<string> {
+  if (Deno.stdin.isTerminal()) {
+    return (promptSecret("Paste app password (input hidden): ") ?? "").trim();
+  }
+  return (await new Response(Deno.stdin.readable).text()).trim();
+}
+
+/**
+ * atproto login: store an app password and mint a first session. createSession
+ * validates the credentials, so a wrong password fails before anything persists.
+ */
+async function loginAtproto(
+  entry: RegistryEntry,
+  identifierFlag: string | undefined,
+): Promise<void> {
+  if (entry.auth.kind !== "atproto") return; // for narrowing; never reached
+  const auth = entry.auth;
+  const identifier = identifierFlag ?? auth.identifier;
+  if (!identifier) {
+    console.error(
+      `anyapi-mcp login: "${entry.id}" has no identifier; pass --identifier <handle>.`,
+    );
+    Deno.exit(1);
+  }
+
+  const password = await readAppPassword();
+  if (!password) {
+    console.error("anyapi-mcp login: empty app password; aborting.");
+    Deno.exit(1);
+  }
+
+  // Persist a changed identifier before minting so later refreshes reuse it.
+  if (identifier !== auth.identifier) {
+    auth.identifier = identifier;
+    if (!(await updateEntry(entry))) {
+      console.error(
+        `anyapi-mcp login: "${entry.id}" is no longer registered; aborting.`,
+      );
+      Deno.exit(1);
+    }
+  }
+
+  try {
+    const session = await loginWithAppPassword(
+      auth,
+      entry.baseUrl,
+      identifier,
+      password,
+    );
+    console.error(
+      `\nAuthenticated "${entry.id}" as ${session.handle || identifier}${
+        session.did ? ` (${session.did})` : ""
+      }.\n` +
+        `  App password stored in the OS keychain; sessions refresh automatically.`,
+    );
+  } catch (err) {
+    console.error(
+      `anyapi-mcp login: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    Deno.exit(1);
+  }
+}
+
 export async function runLogin(args: string[]): Promise<void> {
   const flags = parseArgs(args, {
     string: [
+      "identifier",
       "client-id",
       "client-secret",
       "scope",
@@ -86,9 +157,13 @@ export async function runLogin(args: string[]): Promise<void> {
     console.error(`anyapi-mcp login: no API with id "${id}".`);
     Deno.exit(1);
   }
+  if (entry.auth.kind === "atproto") {
+    await loginAtproto(entry, flags.identifier);
+    return;
+  }
   if (entry.auth.kind !== "oauth2") {
     console.error(
-      `anyapi-mcp login: "${id}" is not an OAuth API (auth: ${entry.auth.kind}). ` +
+      `anyapi-mcp login: "${id}" is not an OAuth or atproto API (auth: ${entry.auth.kind}). ` +
         `Re-add it with --oauth (and --auth-url/--token-url if its spec doesn't declare them).`,
     );
     Deno.exit(1);

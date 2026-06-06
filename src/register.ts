@@ -24,6 +24,7 @@ import {
   type DiscoveredOAuth,
   quirkForAuthUrl,
 } from "./oauth.ts";
+import { clearAtprotoSecrets } from "./atproto-auth.ts";
 
 /**
  * Version of the generated-code contract. Bump this whenever a change would make
@@ -84,6 +85,10 @@ export interface RegisterOptions {
   scopeSeparator?: string;
   /** Register with no auth even if OAuth was discovered. */
   noAuth?: boolean;
+  /** atproto: handle or email used to mint sessions. */
+  identifier?: string;
+  /** atproto: app password to store up front (the long-lived secret); else set via `login`. */
+  appPassword?: string;
   /** Overwrite an existing entry with the same id instead of failing. */
   force?: boolean;
   /** Optional progress sink (the CLI passes console.error; the MCP tool omits it). */
@@ -134,6 +139,7 @@ export interface RegisterResult {
 function secretAccounts(auth: Auth): string[] {
   if (auth.kind === "bearer") return [auth.tokenKey];
   if (auth.kind === "oauth2") return [auth.clientKey, auth.tokenKey];
+  if (auth.kind === "atproto") return [auth.passwordKey, auth.sessionKey];
   return [];
 }
 
@@ -182,6 +188,13 @@ export async function unregisterApi(id: string): Promise<UnregisterResult> {
     secretsNote = `deleted OAuth secrets (token: ${
       token ? "yes" : "none"
     }, client: ${client ? "yes" : "none"})`;
+  } else if (entry.auth.kind === "atproto") {
+    const { session, password } = await clearAtprotoSecrets(entry.auth, {
+      forgetPassword: true,
+    });
+    secretsNote = `deleted atproto secrets (session: ${
+      session ? "yes" : "none"
+    }, app password: ${password ? "yes" : "none"})`;
   }
 
   await removeEntry(id);
@@ -239,12 +252,23 @@ export async function registerApi(
   await prepared.writeTypes(typesPath);
   await writeOpsIndex(id, prepared.operations);
 
-  // Auth precedence: an explicit --token wins (bearer); --no-auth forces none;
-  // otherwise OAuth is adopted when discovered or explicitly requested. The
-  // browser login happens later via `anyapi-mcp login` - registration only
-  // records the (unauthenticated) OAuth config.
+  // Auth precedence: an atproto API always uses app-password sessions; otherwise
+  // an explicit --token wins (bearer); --no-auth forces none; else OAuth is
+  // adopted when discovered or explicitly requested. The actual login happens
+  // later via `anyapi-mcp login` - registration only records the config (and
+  // stores an app password / token if one was supplied up front).
   let auth: Auth = { kind: "none" };
-  if (opts.token !== undefined) {
+  if (kind === "atproto") {
+    const passwordKey = `anyapi-mcp:${id}:apppass`;
+    const sessionKey = `anyapi-mcp:${id}:session`;
+    if (opts.appPassword) await setSecret(passwordKey, opts.appPassword);
+    auth = {
+      kind: "atproto",
+      identifier: opts.identifier ?? "",
+      passwordKey,
+      sessionKey,
+    };
+  } else if (opts.token !== undefined) {
     const tokenKey = `anyapi-mcp:${id}`;
     await setSecret(tokenKey, opts.token);
     auth = { kind: "bearer", header: "Authorization", tokenKey };
@@ -276,6 +300,18 @@ export async function registerApi(
     // in). Only drop secrets, and a types file at a now-stale path (kind change),
     // that the new entry no longer references.
     await cleanupOrphanedSecrets(existing.auth, entry.auth);
+    // An atproto re-register that changes the account must not keep acting as the
+    // old one: the cached session is the old identifier's, and the stored app
+    // password is too (unless this call supplied a new one). Drop them so the next
+    // execute re-auths as the new identifier instead of silently using the old.
+    if (
+      existing.auth.kind === "atproto" && entry.auth.kind === "atproto" &&
+      existing.auth.identifier !== entry.auth.identifier
+    ) {
+      await clearAtprotoSecrets(entry.auth, {
+        forgetPassword: !opts.appPassword,
+      });
+    }
     if (existing.typesPath !== entry.typesPath) {
       try {
         await Deno.remove(existing.typesPath);

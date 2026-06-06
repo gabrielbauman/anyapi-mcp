@@ -16,12 +16,14 @@ Usage:
   anyapi-mcp add <url-or-path> [options]
 
 Options:
-  --kind <openapi|graphql|soap>  Protocol (default: openapi). "graphql" introspects an endpoint; "soap" reads a WSDL URL.
+  --kind <openapi|graphql|soap|atproto>  Protocol (default: openapi). "graphql" introspects an endpoint; "soap" reads a WSDL URL; "atproto" takes a PDS/service URL (e.g. https://bsky.social).
   --id <slug>        Id used on the CLI and in execute (default: base URL in reverse-DNS form, e.g. com.github.api)
   --name <name>      Human-friendly name (default: spec title / endpoint host)
   --base-url <url>   Override the base URL derived from the source
   --docs <url>       Documentation URL to store and surface (not parsed)
   --token            Store a bearer token (read without echo, or piped via stdin)
+  --identifier <h>   atproto: the account handle/email to authenticate as
+  --app-password     atproto: store an app password now (read without echo, or piped via stdin)
   --oauth            Treat this API as OAuth 2.0 even if the spec doesn't declare it
   --auth-url <url>   OAuth authorize endpoint (overrides the spec's value)
   --token-url <url>  OAuth token endpoint (overrides the spec's value)
@@ -32,12 +34,14 @@ Options:
   -h, --help         Show this help
 
 OpenAPI specs that declare an OAuth2 authorization-code flow are detected
-automatically; after adding, run \`anyapi-mcp login <id>\` to authenticate.`;
+automatically; after adding, run \`anyapi-mcp login <id>\` to authenticate.
+For atproto, run \`anyapi-mcp login <id> --identifier <handle>\` (or pass
+--identifier/--app-password here) to store an app password.`;
 
-/** Read a token without echo from a TTY, or from piped stdin in non-interactive use. */
-async function readToken(): Promise<string> {
+/** Read a secret without echo from a TTY, or from piped stdin in non-interactive use. */
+async function readSecret(prompt: string): Promise<string> {
   if (Deno.stdin.isTerminal()) {
-    return (promptSecret("Paste token (input hidden): ") ?? "").trim();
+    return (promptSecret(prompt) ?? "").trim();
   }
   return (await new Response(Deno.stdin.readable).text()).trim();
 }
@@ -50,13 +54,14 @@ export async function runAdd(args: string[]): Promise<void> {
       "base-url",
       "docs",
       "kind",
+      "identifier",
       "auth-url",
       "token-url",
       "scope",
       "scope-separator",
     ],
     collect: ["scope"],
-    boolean: ["help", "no-auth", "token", "oauth", "force"],
+    boolean: ["help", "no-auth", "token", "app-password", "oauth", "force"],
     alias: { h: "help" },
   });
 
@@ -71,6 +76,7 @@ export async function runAdd(args: string[]): Promise<void> {
     console.error(HELP);
     Deno.exit(1);
   }
+  const kind = flags.kind as ApiKind | undefined;
   if (flags.token && flags["no-auth"]) {
     console.error(
       "anyapi-mcp add: pass either --token or --no-auth, not both.",
@@ -83,15 +89,41 @@ export async function runAdd(args: string[]): Promise<void> {
     );
     Deno.exit(1);
   }
+  if ((flags["app-password"] || flags.identifier) && kind !== "atproto") {
+    console.error(
+      "anyapi-mcp add: --identifier/--app-password apply only to --kind atproto.",
+    );
+    Deno.exit(1);
+  }
+  if (kind === "atproto" && flags.token) {
+    console.error(
+      "anyapi-mcp add: atproto APIs use app passwords, not --token (use --app-password).",
+    );
+    Deno.exit(1);
+  }
+  if (flags["app-password"] && !flags.identifier) {
+    console.error(
+      "anyapi-mcp add: --app-password requires --identifier <handle> (who to authenticate as).",
+    );
+    Deno.exit(1);
+  }
 
   const specSource = isUrl(rawSource) ? rawSource : resolve(rawSource);
 
-  // Read the token (if any) before the slow type-gen step so the prompt comes first.
+  // Read secrets (if any) before the slow type-gen step so the prompt comes first.
   let token: string | undefined;
   if (flags.token) {
-    token = await readToken();
+    token = await readSecret("Paste token (input hidden): ");
     if (!token) {
       console.error("anyapi-mcp add: empty token; aborting.");
+      Deno.exit(1);
+    }
+  }
+  let appPassword: string | undefined;
+  if (flags["app-password"]) {
+    appPassword = await readSecret("Paste app password (input hidden): ");
+    if (!appPassword) {
+      console.error("anyapi-mcp add: empty app password; aborting.");
       Deno.exit(1);
     }
   }
@@ -100,12 +132,14 @@ export async function runAdd(args: string[]): Promise<void> {
   try {
     const { entry, operationCount, overwritten } = await registerApi({
       specSource,
-      kind: flags.kind as ApiKind | undefined,
+      kind,
       id: flags.id,
       name: flags.name,
       baseUrl: flags["base-url"],
       docsUrl: flags.docs,
       token,
+      identifier: flags.identifier,
+      appPassword,
       oauth: flags.oauth,
       authUrl: flags["auth-url"],
       tokenUrl: flags["token-url"],
@@ -119,6 +153,8 @@ export async function runAdd(args: string[]): Promise<void> {
       ? `bearer (${entry.auth.tokenKey})`
       : entry.auth.kind === "oauth2"
       ? `oauth2 (not logged in)`
+      : entry.auth.kind === "atproto"
+      ? `atproto (${entry.auth.identifier || "no identifier yet"})`
       : entry.auth.kind;
     console.error(
       `${
@@ -145,6 +181,28 @@ export async function runAdd(args: string[]): Promise<void> {
           `  authorize: ${entry.auth.authorizationUrl}\n` +
           `  scopes:    ${scopeList}`,
       );
+    }
+    if (entry.auth.kind === "atproto") {
+      if (!entry.auth.identifier) {
+        console.error(
+          `\nRegistered for anonymous (unauthenticated) reads against ${
+            entry.hosts.join(", ")
+          }.\n` +
+            `To act as an account (writes + private reads), re-add with --identifier ` +
+            `<handle> pointed at your PDS (e.g. https://bsky.social), then ` +
+            `\`anyapi-mcp login ${entry.id}\`.`,
+        );
+      } else if (appPassword) {
+        console.error(
+          `\nStored an app password for ${entry.auth.identifier}; a session mints on first use.`,
+        );
+      } else {
+        console.error(
+          `\nTo authenticate as ${entry.auth.identifier} (stores an app password in your OS keychain):\n` +
+            `  anyapi-mcp login ${entry.id}\n` +
+            `Create an app password at https://bsky.app/settings/app-passwords (or your PDS).`,
+        );
+      }
     }
   } catch (err) {
     console.error(

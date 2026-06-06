@@ -3,6 +3,7 @@
 import { readRegistry } from "../registry.ts";
 import { readOpsIndex } from "../operation.ts";
 import { describeExpiry, loadToken } from "../oauth.ts";
+import { atprotoAuthStatus } from "../atproto-auth.ts";
 
 export async function runList(_args: string[]): Promise<void> {
   const entries = await readRegistry();
@@ -25,6 +26,10 @@ export async function runList(_args: string[]): Promise<void> {
         ? `oauth2 (logged in, ${describeExpiry(token)})`
         : "oauth2 (not logged in)";
       loginHint = !token;
+    } else if (e.auth.kind === "atproto") {
+      const status = await atprotoAuthStatus(e.auth);
+      authText = status.text;
+      loginHint = status.needsLogin;
     }
     console.log(`${e.id}  -  ${e.name}`);
     console.log(`  base URL: ${e.baseUrl}`);

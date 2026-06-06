@@ -5,14 +5,15 @@
 import { parseArgs } from "@std/cli/parse-args";
 import { findEntry } from "../registry.ts";
 import { clearOAuthSecrets } from "../oauth.ts";
+import { clearAtprotoSecrets } from "../atproto-auth.ts";
 
-const HELP = `anyapi-mcp logout - remove stored OAuth tokens for an API
+const HELP = `anyapi-mcp logout - remove stored tokens/session for an API
 
 Usage:
   anyapi-mcp logout <id> [--forget-client]
 
 Options:
-  --forget-client   Also delete the stored client id/secret (re-enter them at next login)
+  --forget-client   OAuth: also delete the stored client id/secret. atproto: also delete the stored app password (otherwise the session re-mints from it on next use).
   -h, --help        Show this help`;
 
 export async function runLogout(args: string[]): Promise<void> {
@@ -38,9 +39,32 @@ export async function runLogout(args: string[]): Promise<void> {
     console.error(`anyapi-mcp logout: no API with id "${id}".`);
     Deno.exit(1);
   }
+  if (entry.auth.kind === "atproto") {
+    const { session, password } = await clearAtprotoSecrets(entry.auth, {
+      forgetPassword: flags["forget-client"],
+    });
+    console.error(
+      session
+        ? `Logged out of "${id}" (session removed).`
+        : `"${id}" had no stored session.`,
+    );
+    if (flags["forget-client"]) {
+      console.error(
+        password
+          ? "App password removed; run `anyapi-mcp login` again to re-authenticate."
+          : "No app password was stored.",
+      );
+    } else if (session) {
+      // The app password is kept by default; make the self-heal explicit.
+      console.error(
+        "App password kept; the session re-mints on next use. Pass --forget-client to remove it.",
+      );
+    }
+    return;
+  }
   if (entry.auth.kind !== "oauth2") {
     console.error(
-      `anyapi-mcp logout: "${id}" is not an OAuth API (auth: ${entry.auth.kind}); nothing to do.`,
+      `anyapi-mcp logout: "${id}" is not an OAuth or atproto API (auth: ${entry.auth.kind}); nothing to do.`,
     );
     Deno.exit(1);
   }

@@ -39,6 +39,11 @@ import {
   runAuthorizationCodeFlow,
   saveToken,
 } from "../oauth.ts";
+import {
+  atprotoAuthStatus,
+  AtprotoNeedsLoginError,
+  ensureAtprotoAccessToken,
+} from "../atproto-auth.ts";
 
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 50;
@@ -70,6 +75,14 @@ const EXEC_SHAPE_BULLETS: Record<ApiKind, string> = {
     "available as Schema.* (e.g. `client.query<{ user: Schema.User }>(...)`).\n",
   soap: "- SOAP (kind soap): one method per operation - " +
     "`const { status, data, raw } = await client.OperationName({ ...args });` (data is the parsed Body).\n",
+  atproto:
+    "- atproto (kind atproto): `client.query(nsid, params)` for lexicon queries and " +
+    "`client.procedure(nsid, input)` for procedures, e.g. " +
+    '`const tl = await client.query("app.bsky.feed.getTimeline", { limit: 20 });`. The NSID ' +
+    "string literal selects the official @atproto/api types, so params, input, and the awaited " +
+    "result are fully typed (tl.feed here). Pass {} when a query takes no params. Public reads " +
+    "work unauthenticated; writes and private data need a session (the user logs in once via " +
+    "`anyapi-mcp login`).\n",
 };
 
 /**
@@ -82,7 +95,7 @@ function buildExecuteDescription(kinds: Set<ApiKind>): string {
     `Run TypeScript against a registered API. A typed "client" is already in scope, with auth ` +
     `injected automatically. The client's shape depends on the API's kind (shown by list_apis; ` +
     `search's method also signals it):\n`;
-  const order: ApiKind[] = ["openapi", "graphql", "soap"];
+  const order: ApiKind[] = ["openapi", "graphql", "soap", "atproto"];
   const bullets = order
     .filter((k) => kinds.size === 0 || kinds.has(k))
     .map((k) => EXEC_SHAPE_BULLETS[k])
@@ -116,9 +129,12 @@ const CONFIGURE_OAUTH_DESCRIPTION =
 
 const ADD_API_DESCRIPTION =
   "Register a new API so search/execute can use it. Pass an OpenAPI spec URL (kind " +
-  '"openapi", the default), a GraphQL endpoint URL (kind "graphql", introspected), or a WSDL ' +
-  'URL (kind "soap"). Generates a typed client and makes the API available immediately (no ' +
-  "restart). Use this for public APIs. For an API that requires a secret token, do NOT pass the " +
+  '"openapi", the default), a GraphQL endpoint URL (kind "graphql", introspected), a WSDL ' +
+  'URL (kind "soap"), or a PDS/service URL (kind "atproto", e.g. https://bsky.social) for AT ' +
+  "Protocol/lexicon/XRPC. Generates a typed client and makes the API available immediately (no " +
+  "restart). Use this for public APIs. For an atproto API, optionally pass identifier (the " +
+  "account handle, not a secret); the user sets the app password later via `anyapi-mcp login`. " +
+  "For an API that requires a secret token, do NOT pass the " +
   "token here - tell the user to run `anyapi-mcp add <url> --token [--kind …]` in a " +
   "shell, which stores it in the OS keychain. If the spec's server can't be derived (it lands on a " +
   "raw-file host like raw.githubusercontent.com), registration fails loudly - pass baseUrl with the " +
@@ -127,7 +143,7 @@ const ADD_API_DESCRIPTION =
   "Input: { specUrl, kind?, id?, name?, baseUrl?, docsUrl?, force? }.";
 
 const LIST_APIS_DESCRIPTION =
-  "List the registered APIs as JSON - each with id, name, kind (openapi/graphql/soap), baseUrl, " +
+  "List the registered APIs as JSON - each with id, name, kind (openapi/graphql/soap/atproto), baseUrl, " +
   "operation count, a short description (when the spec provides one), auth status (including OAuth " +
   "login/expiry), and docsUrl. Use it to see what's available and what each API is for, or to confirm " +
   "an add_api/remove_api took effect. Pass an `api` id to get just that one API plus its capability " +
@@ -154,7 +170,7 @@ function howToAdd(): string {
 
 function buildInstructions(entries: RegistryEntry[]): string {
   const intro =
-    "anyapi-mcp turns HTTP APIs (OpenAPI, GraphQL, SOAP) into code you run. `search` finds " +
+    "anyapi-mcp turns HTTP APIs (OpenAPI, GraphQL, SOAP, AT Protocol/XRPC) into code you run. `search` finds " +
     "operations; `execute` runs TypeScript against a typed `client` (chain several calls in one " +
     "execute - intermediate data stays in the sandbox, saving round-trips). `list_apis` shows what's " +
     "registered; `add_api` registers more (force:true overwrites a wrong one) and `remove_api` " +
@@ -385,6 +401,17 @@ async function executeRequest(
     } catch (err) {
       if (err instanceof OAuthNeedsLoginError) {
         return { text: await oauthGuidance(entry, err.message), isError: true };
+      }
+      throw err;
+    }
+  } else if (entry.auth.kind === "atproto") {
+    // Session mint/refresh happens here in the parent; the sandbox only ever
+    // receives the short-lived access JWT (never the app password or refresh JWT).
+    try {
+      token = await ensureAtprotoAccessToken(entry, entry.auth);
+    } catch (err) {
+      if (err instanceof AtprotoNeedsLoginError) {
+        return { text: err.message, isError: true };
       }
       throw err;
     }
@@ -667,6 +694,8 @@ async function listApisResult(
       auth = token
         ? `oauth2 (logged in, ${describeExpiry(token)})`
         : "oauth2 (not logged in)";
+    } else if (e.auth.kind === "atproto") {
+      auth = (await atprotoAuthStatus(e.auth)).text;
     }
     const api: Record<string, unknown> = {
       id: e.id,
@@ -907,10 +936,15 @@ export async function runServe(_args: string[]): Promise<void> {
 
   const addApiShape = {
     specUrl: z.string().describe(
-      'OpenAPI spec URL (or path); a GraphQL endpoint URL for kind "graphql"; a WSDL URL for kind "soap"',
+      'OpenAPI spec URL (or path); a GraphQL endpoint URL for kind "graphql"; a WSDL URL for ' +
+        'kind "soap"; a PDS/service URL (e.g. https://bsky.social) for kind "atproto"',
     ),
-    kind: z.enum(["openapi", "graphql", "soap"]).optional().describe(
-      'Protocol adapter: "openapi" (default), "graphql", or "soap"',
+    kind: z.enum(["openapi", "graphql", "soap", "atproto"]).optional().describe(
+      'Protocol adapter: "openapi" (default), "graphql", "soap", or "atproto" (AT Protocol / lexicon / XRPC)',
+    ),
+    identifier: z.string().optional().describe(
+      "atproto only: the account handle or email to authenticate as (not a secret). " +
+        "The app password is set separately by the user via `anyapi-mcp login`.",
     ),
     id: z.string().optional().describe(
       "Id used by search/execute (default: the base URL in reverse-DNS form, e.g. com.github.api)",
@@ -937,13 +971,15 @@ export async function runServe(_args: string[]): Promise<void> {
       inputSchema: addApiShape,
     },
     async (
-      { specUrl, kind, id, name, baseUrl, docsUrl, force }: AddApiArgs,
+      { specUrl, kind, identifier, id, name, baseUrl, docsUrl, force }:
+        AddApiArgs,
     ) => {
       try {
         const specSource = isUrl(specUrl) ? specUrl : resolve(specUrl);
         const { entry, operationCount, overwritten } = await registerApi({
           specSource,
           kind,
+          identifier,
           id,
           name,
           baseUrl,
@@ -959,18 +995,33 @@ export async function runServe(_args: string[]): Promise<void> {
           } "${entry.id}" (${entry.name}): ` +
           `${operationCount} operations, base ${entry.baseUrl}. ` +
           `Available now - call search with api "${entry.id}", then execute.`;
-        const authHelp = entry.auth.kind === "oauth2"
-          ? ` This API uses OAuth 2.0. The user must create an OAuth app (redirect ` +
+        let authHelp: string;
+        if (entry.auth.kind === "oauth2") {
+          authHelp =
+            ` This API uses OAuth 2.0. The user must create an OAuth app (redirect ` +
             `URL ${entry.auth.redirectUri}) and run \`anyapi-mcp login ${entry.id} ` +
             `--client-id <id> --client-secret <secret>\` in a shell (secrets never go ` +
             `through this chat). After that, execute works and you can call the ` +
-            `authenticate tool to re-login if a session expires.`
-          : ` If requests come back 401/403 this API needs a token: run ` +
+            `authenticate tool to re-login if a session expires.`;
+        } else if (entry.auth.kind === "atproto") {
+          authHelp = entry.auth.identifier
+            ? ` This is an AT Protocol API set up for ${entry.auth.identifier}. To act as ` +
+              `that account the user runs \`anyapi-mcp login ${entry.id}\` in a shell (stores ` +
+              `an app password in the OS keychain; secrets never go through this chat); then ` +
+              `execute works and sessions refresh automatically.`
+            : ` This is an AT Protocol API registered for anonymous reads - public data works ` +
+              `in execute right now. For writes or private data, the user re-adds it with ` +
+              `--identifier <handle> pointed at their PDS (e.g. https://bsky.social) and runs ` +
+              `\`anyapi-mcp login\`.`;
+        } else {
+          authHelp =
+            ` If requests come back 401/403 this API needs a token: run ` +
             `\`anyapi-mcp add ${specSource} --id ${entry.id} --token${kindFlag}\` in a shell so the token ` +
             `is stored in your OS keychain (never through this chat).`;
-        // A new registration may introduce a kind (e.g. the first GraphQL/SOAP
-        // API in an OpenAPI-only session); refresh the execute description so its
-        // client shape is documented immediately.
+        }
+        // A new registration may introduce a kind (e.g. the first GraphQL / SOAP /
+        // atproto API in an OpenAPI-only session); refresh the execute description
+        // so its client shape is documented immediately.
         syncExecuteDescription(await readRegistry());
         return { content: [{ type: "text" as const, text: head + authHelp }] };
       } catch (err) {

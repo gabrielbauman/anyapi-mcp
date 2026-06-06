@@ -1,24 +1,30 @@
 // `anyapi-mcp install` - register this MCP server with local clients so you don't
-// have to wire it up by hand. Targets Claude Code (via the `claude` CLI) and
-// Claude Desktop (by editing its config file), pointing both at `<binary> serve`.
+// have to wire it up by hand. Targets Claude Code (via the `claude` CLI), Claude
+// Desktop, and OpenCode (by editing their config files), pointing each at
+// `<binary> serve`.
+//
+// OpenCode's `opencode mcp add` is an interactive wizard with no flags, so it
+// can't be driven unattended; per its docs we register by merging an `mcp` entry
+// into its config (the same read-modify-write we do for Claude Desktop).
 //
 // It registers the path of the running binary, so run it from the installed
 // `anyapi-mcp`, not via `deno task dev` (where the running executable is `deno`).
 
 import { parseArgs } from "@std/cli/parse-args";
 import { basename, dirname, join, resolve } from "@std/path";
+import { ensureDir } from "@std/fs";
 
 const HELP = `anyapi-mcp install - register this MCP server with local clients
 
 Usage:
   anyapi-mcp install [options]
 
-Points Claude Code (via the \`claude\` CLI) and/or Claude Desktop (via its config
-file) at this binary's \`serve\` command. Run it from the compiled binary so it
-registers that binary's own path.
+Points Claude Code (via the \`claude\` CLI), Claude Desktop, and OpenCode (via
+their config files) at this binary's \`serve\` command. Run it from the compiled
+binary so it registers that binary's own path.
 
 Options:
-  --client <code|desktop|all>   Client(s) to set up (default: all available)
+  --client <code|desktop|opencode|all>  Client(s) to set up (default: all available)
   --command <path>              Path to register (default: this binary)
   --scope <user|project|local>  Claude Code scope (default: user)
   --name <name>                 Server name to register as (default: anyapi-mcp)
@@ -146,6 +152,76 @@ async function installDesktop(opts: Options): Promise<string> {
     `  Restart Claude Desktop to load it.`;
 }
 
+/** OpenCode's global config directory ($XDG_CONFIG_HOME/opencode or ~/.config/opencode). */
+function opencodeConfigDir(): string | null {
+  const home = Deno.env.get("HOME");
+  if (!home) return null;
+  const xdg = Deno.env.get("XDG_CONFIG_HOME");
+  const base = xdg && xdg.trim() !== "" ? xdg : join(home, ".config");
+  return join(base, "opencode");
+}
+
+async function installOpencode(opts: Options): Promise<string> {
+  const manual =
+    `  By hand: run \`opencode mcp add\` (interactive), or add to opencode.json:\n` +
+    `    "mcp": { "${opts.name}": { "type": "local", "command": ["${opts.command}", "serve"], "enabled": true } }`;
+  const dir = opencodeConfigDir();
+  if (!dir) return `OpenCode: HOME not set; skipped.\n${manual}`;
+  // Detect OpenCode by its config dir (PATH-independent; `opencode mcp add` is an
+  // interactive wizard we can't script, so we edit the config instead).
+  if (!(await pathExists(dir))) {
+    return `OpenCode: not installed (no ${dir}); skipped.`;
+  }
+
+  // Prefer an existing config file; only fall back to creating opencode.json so we
+  // don't leave a second file competing with an existing opencode.jsonc.
+  let configPath = join(dir, "opencode.json");
+  const jsonc = join(dir, "opencode.jsonc");
+  if (!(await pathExists(configPath)) && (await pathExists(jsonc))) {
+    configPath = jsonc;
+  }
+
+  // Read-modify-write so other servers/settings survive. Refuse to clobber a
+  // config we can't parse (e.g. a .jsonc with comments) - report manual steps.
+  let config: Record<string, unknown> = {};
+  let existed = false;
+  if (await pathExists(configPath)) {
+    const raw = await Deno.readTextFile(configPath);
+    if (raw.trim() !== "") {
+      existed = true;
+      try {
+        config = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        return `OpenCode: config at ${configPath} isn't plain JSON (comments?); left untouched.\n${manual}`;
+      }
+    }
+  }
+  // Only stamp $schema on a freshly created config; don't edit an existing one's shape.
+  if (!existed && typeof config["$schema"] !== "string") {
+    config["$schema"] = "https://opencode.ai/config.json";
+  }
+  if (
+    typeof config.mcp !== "object" || config.mcp === null ||
+    Array.isArray(config.mcp)
+  ) {
+    config.mcp = {};
+  }
+  const servers = config.mcp as Record<string, unknown>;
+  servers[opts.name] = {
+    type: "local",
+    command: [opts.command, "serve"],
+    enabled: true,
+  };
+
+  if (opts.dryRun) {
+    return `OpenCode: would set mcp.${opts.name} in ${configPath}`;
+  }
+  await ensureDir(dir);
+  await Deno.writeTextFile(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  return `OpenCode: registered "${opts.name}" in ${configPath}\n` +
+    `  Restart OpenCode to load it.`;
+}
+
 export async function runInstall(args: string[]): Promise<void> {
   const flags = parseArgs(args, {
     string: ["client", "command", "scope", "name"],
@@ -168,9 +244,9 @@ export async function runInstall(args: string[]): Promise<void> {
   const command = resolve(flags.command ?? selfPath);
 
   const client = (flags.client ?? "all").toLowerCase();
-  if (!["code", "desktop", "all"].includes(client)) {
+  if (!["code", "desktop", "opencode", "all"].includes(client)) {
     console.error(
-      `anyapi-mcp install: unknown --client "${flags.client}" (use code, desktop, or all).`,
+      `anyapi-mcp install: unknown --client "${flags.client}" (use code, desktop, opencode, or all).`,
     );
     Deno.exit(1);
   }
@@ -196,6 +272,9 @@ export async function runInstall(args: string[]): Promise<void> {
     }
     if (client === "desktop" || client === "all") {
       results.push(await installDesktop(opts));
+    }
+    if (client === "opencode" || client === "all") {
+      results.push(await installOpencode(opts));
     }
   } catch (err) {
     console.error(
