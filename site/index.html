@@ -3,11 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>anyapi-mcp - one MCP server for almost any HTTP API</title>
-  <meta name="description" content="One local MCP server that lets your model talk to almost any HTTP API: OpenAPI, GraphQL, or SOAP/WSDL. Install with a single command.">
+  <title>anyapi-mcp - one MCP server, every API your model needs</title>
+  <meta name="description" content="One local MCP server that lets your model use any HTTP API you register - OpenAPI, GraphQL, SOAP/WSDL, or AT Protocol (Bluesky). Register as many as you want; it searches and calls whichever the task needs, and can add more on the fly.">
   <meta name="theme-color" content="#0b0e13">
   <meta property="og:title" content="anyapi-mcp">
-  <meta property="og:description" content="One local MCP server for almost any HTTP API. Point it at an OpenAPI spec, a GraphQL endpoint, or a SOAP/WSDL service and your model can call it right away.">
+  <meta property="og:description" content="Run one local MCP server, then ask your model to use any HTTP API - OpenAPI, GraphQL, SOAP/WSDL, or AT Protocol (Bluesky). Register as many as you want; it calls whichever the task needs, no tool-per-endpoint bloat, no restart.">
   <meta property="og:type" content="website">
   <style>
     :root {
@@ -134,11 +134,14 @@
     </header>
 
     <main>
-      <h1>One MCP server for almost any HTTP API.</h1>
+      <h1>Ask your model to use any API.</h1>
       <p class="lede">
-        Point it at an OpenAPI spec, a GraphQL endpoint, or a SOAP/WSDL service,
-        and your model can search and call it right away, driving a typed
-        client by writing code instead of one MCP tool per endpoint.
+        anyapi-mcp is one local MCP server for all the APIs your model needs.
+        Register as many as you want - OpenAPI specs, GraphQL endpoints,
+        SOAP/WSDL services, AT Protocol services like Bluesky - and your model
+        searches and calls whichever the task needs by writing code against a
+        typed client. It can even register new ones mid-conversation. No tool
+        per endpoint, no restart.
       </p>
 
       <div class="install">
@@ -156,14 +159,19 @@
       <section>
         <h2>Then</h2>
         <ol class="steps">
-          <li><code class="inline">anyapi-mcp install</code> - register it with Claude Code and/or Claude Desktop.</li>
-          <li><code class="inline">anyapi-mcp add &lt;spec-url&gt;</code> - point it at an API.</li>
+          <li>Ask your model to register an API - give it any OpenAPI, GraphQL, SOAP, or AT Protocol URL.</li>
           <li>Ask your model to use it. It searches, writes a short program, and runs it.</li>
         </ol>
+        <p class="note">
+          Prefer the terminal? It's a full CLI too -
+          <code class="inline">anyapi-mcp add</code>, <code class="inline">list</code>,
+          <code class="inline">login</code>, and more
+          (<code class="inline">anyapi-mcp --help</code>).
+        </p>
       </section>
 
       <section>
-        <h2>Three tools, not three hundred</h2>
+        <h2>A handful of tools, not hundreds</h2>
         <div class="grid">
           <div class="card">
             <h3>search</h3>
@@ -179,9 +187,12 @@
           </div>
         </div>
         <p class="note">
-          The model writes code and runs it; intermediate results stay in the
-          sandbox instead of round-tripping through the model, so a ten-step
-          workflow costs one tool call and a handful of tokens, not ten.
+          These are the three you'll use most (a few more handle listing,
+          removing, and signing in). The set is fixed - it never grows into one
+          tool per endpoint, however many APIs you register. The model writes
+          code and runs it, and intermediate results stay in the sandbox instead
+          of round-tripping through the model, so a ten-step workflow costs one
+          tool call and a handful of tokens, not ten.
         </p>
       </section>
     </main>

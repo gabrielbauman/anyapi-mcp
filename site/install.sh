@@ -1,11 +1,14 @@
 #!/bin/sh
-# anyapi-mcp installer: build the CLI from source and drop it on your PATH.
+# anyapi-mcp installer: build the CLI from source, drop it on your PATH, and
+# register it with your MCP clients (Claude Code, Claude Desktop, OpenCode) so the
+# model can use it right away.
 #
 #   curl -fsSL https://gabrielbauman.github.io/anyapi-mcp/install.sh | sh
 #
 # Overridable via environment:
-#   ANYAPI_MCP_REF      git ref (branch or tag) to install   (default: main)
-#   ANYAPI_MCP_BIN_DIR  directory to install the binary into  (default: ~/.local/bin)
+#   ANYAPI_MCP_REF         git ref (branch or tag) to install   (default: main)
+#   ANYAPI_MCP_BIN_DIR     directory to install the binary into  (default: ~/.local/bin)
+#   ANYAPI_MCP_NO_INSTALL  set to any value to skip registering with MCP clients (Claude Code, Desktop, OpenCode)
 set -eu
 
 REPO="gabrielbauman/anyapi-mcp"
@@ -53,7 +56,25 @@ mv "$tmp/src/$BIN_NAME" "$BIN_DIR/$BIN_NAME"
 chmod +x "$BIN_DIR/$BIN_NAME"
 info "Installed $BIN_NAME to $BIN_DIR/$BIN_NAME"
 
-# 5. PATH hint, then next steps.
+# 5. Register with local MCP clients (Claude Code, Claude Desktop, OpenCode) so the
+#    model can use it right away. Run via the full path (BIN_DIR may not be on PATH yet) and
+#    best-effort: a missing/odd client shouldn't fail an otherwise-good install.
+#    Opt out with ANYAPI_MCP_NO_INSTALL (e.g. to register manually at a different scope).
+if [ -n "${ANYAPI_MCP_NO_INSTALL:-}" ]; then
+  info ""
+  info "Skipping client registration (ANYAPI_MCP_NO_INSTALL set); register later with:"
+  info "  $BIN_NAME install"
+else
+  info ""
+  info "Registering with your MCP clients ($BIN_NAME install) ..."
+  if ! "$BIN_DIR/$BIN_NAME" install; then
+    info ""
+    info "note: automatic registration didn't finish; run it yourself with:"
+    info "  $BIN_NAME install"
+  fi
+fi
+
+# 6. PATH hint.
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)
@@ -63,7 +84,8 @@ case ":$PATH:" in
     ;;
 esac
 
+# 7. Next steps.
 info ""
-info "Done. Next:"
-info "  $BIN_NAME install        # register it with Claude Code and/or Claude Desktop"
+info "Done. Try it:"
 info "  $BIN_NAME add https://petstore3.swagger.io/api/v3/openapi.json"
+info "Then start (or restart) your client and ask your model to use it."

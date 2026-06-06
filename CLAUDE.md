@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 anyapi-mcp is a Deno 2.x CLI + stdio MCP server (TypeScript, strict) that turns
-an HTTP API (OpenAPI, GraphQL, or SOAP/WSDL) into a typed client the model
-drives by writing code. See [README.md](README.md) for the user-facing pitch.
+an HTTP API (OpenAPI, GraphQL, SOAP/WSDL, or AT Protocol/lexicon/XRPC) into a
+typed client the model drives by writing code. See [README.md](README.md) for
+the user-facing pitch.
 
 ## Commands
 
@@ -29,23 +30,24 @@ protocol plugs in through one in-tree adapter object.
 - `src/commands/{add,install,list,regenerate,login,logout,remove,serve}.ts`: one
   file per subcommand. `serve.ts` is the MCP server exposing `search`,
   `execute`, `authenticate`, `configure_oauth`, `add_api`, `list_apis`,
-  `remove_api`; `install.ts` registers anyapi-mcp with Claude Code / Desktop;
-  `login`/`logout` manage OAuth sessions; `regenerate.ts` rebuilds generated
-  code from saved sources (credentials untouched) — and `serve` runs the same
-  pass on stale entries at startup (see `register.ts`).
+  `remove_api`; `install.ts` registers anyapi-mcp with Claude Code, Claude
+  Desktop, and OpenCode; `login`/`logout` manage OAuth sessions and atproto
+  app-password sessions; `regenerate.ts` rebuilds generated code from saved
+  sources (credentials untouched) — and `serve` runs the same pass on stale
+  entries at startup (see `register.ts`).
 - `src/adapter.ts`: the `ProtocolAdapter` seam. `prepare()` turns a source into
   base URL + hosts + operation index + generated client types (+ optional
   discovered OAuth config); `buildHarness()` builds the `execute` preamble that
   puts a typed `client` in scope.
 - `src/adapters.ts`: discriminated-union registry keyed by `kind`. **Adding a
   protocol means a new entry here plus an adapter file, not a plugin system.**
-- `src/openapi.ts` / `src/graphql.ts` / `src/soap.ts`: the three adapters.
-  OpenAPI also does OAuth2 discovery (`discoverOAuth`) and derives the base URL
-  from document-, path-, or operation-level `servers` (`resolveBaseUrl`),
-  failing loudly if the result lands on a raw spec-hosting host (e.g.
-  raw.githubusercontent.com) rather than silently registering a broken base.
-  After `openapi-typescript` writes the `.d.ts`, OpenAPI post-processes it
-  through `src/openapi-sanitize.ts` (see below).
+- `src/openapi.ts` / `src/graphql.ts` / `src/soap.ts` / `src/atproto.ts`: the
+  protocol adapters. OpenAPI also does OAuth2 discovery (`discoverOAuth`) and
+  derives the base URL from document-, path-, or operation-level `servers`
+  (`resolveBaseUrl`), failing loudly if the result lands on a raw spec-hosting
+  host (e.g. raw.githubusercontent.com) rather than silently registering a
+  broken base. After `openapi-typescript` writes the `.d.ts`, OpenAPI
+  post-processes it through `src/openapi-sanitize.ts` (see below).
 - `src/openapi-sanitize.ts`: post-processes openapi-typescript output so a
   recursive "arbitrary JSON" schema (or a `$ref` cycle) can't fail the
   whole-program type check `execute` runs. openapi-typescript references schemas
@@ -63,8 +65,28 @@ protocol plugs in through one in-tree adapter object.
   browser login flow (local one-shot callback server), token storage in the
   keystore, automatic refresh (`ensureAccessToken`), and a small known-provider
   quirks table (e.g. Strava's real endpoints + comma scope separator).
+- `src/atproto.ts`: the AT Protocol adapter. It generates **no** types of its
+  own: `prepare()` dynamic-imports the lexicons shipped in `@atproto/api`
+  (pinned `ATPROTO_API`) to build the operation index from the runtime
+  `schemas`, and `writeTypes` emits only an `XrpcMethods` map (NSID →
+  `{ params, input, output }`) whose members point at the official per-method
+  type namespaces. NSID → namespace name comes from the package's own `ids`
+  export (never derived), so a `Lex.<Name>` reference can't drift and break the
+  whole-program check. The harness imports those types **type-only**
+  (`import type * as Lex`), so nothing from the SDK runs in the sandbox; the
+  client is a thin XRPC fetch wrapper whose `query`/`procedure` infer params +
+  result from the NSID string literal.
+- `src/atproto-auth.ts`: app-password session auth, the atproto analogue of
+  `oauth.ts`. `ensureAtprotoAccessToken` returns `string | undefined` and
+  escalates only as far as needed — empty `identifier` → `undefined` (anonymous;
+  public reads, no token) → cached access JWT → `refreshSession` →
+  `createSession` from the stored app password (the self-heal path; no browser,
+  unlike OAuth) — all in the parent. `identifier` is the intent signal: set
+  means "act as this account" (and a missing session/password is a hard
+  `AtprotoNeedsLoginError`, not a silent anonymous fallback); empty means
+  anonymous by design.
 - `src/registry.ts`: the `apis.jsonl` registry (one `RegistryEntry` per line).
-  `Auth` is a union: `none` | `bearer` | `oauth2`.
+  `Auth` is a union: `none` | `bearer` | `oauth2` | `atproto`.
 - `src/register.ts`: registration logic shared by `add` and `add_api`; resolves
   the OAuth config (precedence: explicit flag > quirk > discovered). `force`
   upserts in place (fresh `addedAt` invalidates serve's ops cache; same-id
@@ -85,7 +107,9 @@ protocol plugs in through one in-tree adapter object.
 - `src/keystore.ts`: OS keychain access (`security` on macOS, `secret-tool` on
   Linux). Service name is `anyapi-mcp`; accounts look like `anyapi-mcp:<id>`
   (bearer), `anyapi-mcp:<id>:client` / `anyapi-mcp:<id>:oauth` (OAuth client
-  creds + token bundle, each a JSON blob).
+  creds + token bundle), and `anyapi-mcp:<id>:apppass` /
+  `anyapi-mcp:<id>:session` (atproto app password + session bundle), each a JSON
+  blob.
 - `src/paths.ts`: XDG dirs. Registry under `~/.config/anyapi-mcp`, generated
   types under `~/.cache/anyapi-mcp`.
 - `src/execute/run.ts`: the sandboxed subprocess runner (per-call `check` and
@@ -106,12 +130,13 @@ protocol plugs in through one in-tree adapter object.
   `--check` — it never touches the net/env allowlist above, so it is not a grant
   widening.
 - **Secrets** live only in the OS keystore. The registry stores keystore account
-  names (`tokenKey`; for OAuth also `clientKey`), never the secret itself. No
-  MCP tool may accept secrets: bearer tokens go through
-  `anyapi-mcp add --token`, and OAuth client credentials go through
-  `anyapi-mcp login` (`--client-id` / `--client-secret`). The agent-facing
-  `authenticate` tool only (re-)runs the browser flow with credentials the user
-  already stored.
+  names (`tokenKey`; for OAuth also `clientKey`; for atproto `passwordKey` /
+  `sessionKey`), never the secret itself. No MCP tool may accept secrets: bearer
+  tokens go through `anyapi-mcp add --token`, OAuth client credentials through
+  `anyapi-mcp login` (`--client-id` / `--client-secret`), and atproto app
+  passwords through `anyapi-mcp login` (`--identifier`, password read without
+  echo) or `add --app-password`. The agent-facing `authenticate` tool only
+  (re-)runs the OAuth browser flow with credentials the user already stored.
 - **Agents may set only the _safe_ OAuth params.** `configure_oauth` (and the
   `login`/`add` CLI) can change `scopes`/`scopeSeparator`/`extraAuthParams`, but
   the `authorizationUrl`/`tokenUrl` endpoints are CLI-only: `tokenUrl` is where
@@ -119,11 +144,13 @@ protocol plugs in through one in-tree adapter object.
   exfiltration vector. `buildAuthorizeUrl` and `configure_oauth` both reject
   `RESERVED_AUTHORIZE_PARAMS` (`client_id`, `redirect_uri`, `response_type`,
   `scope`, `state`) in `extraAuthParams`.
-- **OAuth lives in the parent, never the sandbox.** Token refresh and the login
-  flow run in the serve/CLI process (full net + keystore). The execute sandbox
-  only ever receives a ready access token via `ANYAPI_MCP_TOKEN`; it never sees
-  the client secret or refresh token and never calls the token endpoint. Refresh
-  happens in `executeRequest` (via `ensureAccessToken`) before the harness runs.
+- **OAuth/atproto auth lives in the parent, never the sandbox.** Token/session
+  refresh and the login flow run in the serve/CLI process (full net + keystore).
+  The execute sandbox only ever receives a ready access token/JWT via
+  `ANYAPI_MCP_TOKEN`; it never sees the OAuth client secret/refresh token, nor
+  the atproto app password/refresh JWT, and never calls the token or session
+  endpoints. Refresh happens in `executeRequest` (via `ensureAccessToken` /
+  `ensureAtprotoAccessToken`) before the harness runs.
 - `serve` re-reads the registry on each call, so a mid-session `add_api`/`add`
   is usable without restart. Keep it stateless across calls.
 - Strict TS is on (`noUnusedLocals`, `noUnusedParameters`, `noImplicitOverride`,
@@ -133,8 +160,16 @@ protocol plugs in through one in-tree adapter object.
 
 OpenAPI specs in JSON or YAML — OpenAPI 3.x, or Swagger 2.0 auto-converted to
 3.0 via swagger2openapi — GraphQL endpoints, SOAP/WSDL (WSDL 1.1,
-document/literal). Auth: none, bearer, or OAuth 2.0 **authorization-code** (the
+document/literal), and AT Protocol/lexicon/XRPC (the lexicon set shipped in the
+pinned `@atproto/api`; `add --kind atproto <pds-url>`, e.g.
+https://bsky.social). Auth: none, bearer, OAuth 2.0 **authorization-code** (the
 only OAuth flow; auto-discovered from OpenAPI security schemes, or set manually
-with `--oauth`/`--auth-url`/`--token-url`). No PKCE, no implicit/client-creds/
-password grants yet. Each `execute` is a fresh subprocess with no persisted
-state; OAuth tokens persist in the keystore and refresh automatically.
+with `--oauth`/`--auth-url`/`--token-url`), or atproto **app-password sessions**
+(`createSession`/`refreshSession`, minted/refreshed in the parent; the sandbox
+gets only the access JWT) — or **anonymous** atproto (no `--identifier`) for
+public reads, replacing the old "point an OpenAPI entry at the public AppView"
+trick. No PKCE, no implicit/client-creds/password grants, and no atproto
+**OAuth** (its DPoP-bound tokens can't be replayed as a bearer through the
+sandbox) yet. Each `execute` is a fresh subprocess with no persisted state;
+OAuth tokens and atproto sessions persist in the keystore and refresh
+automatically.

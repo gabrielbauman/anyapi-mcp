@@ -34,13 +34,33 @@ export interface OAuth2Auth {
   tokenKey: string;
 }
 
+/**
+ * AT Protocol (atproto) app-password session auth. Like OAuth, this holds NO
+ * secrets: the app password and the session bundle (access/refresh JWTs) live in
+ * the keystore under `passwordKey`/`sessionKey`. `identifier` (a handle or email)
+ * is not a secret, so it is stored here. Sessions are minted/refreshed in the
+ * parent (see src/atproto-auth.ts); the execute sandbox only ever receives the
+ * short-lived access JWT via ANYAPI_MCP_TOKEN - never the app password or the
+ * refresh JWT.
+ */
+export interface AtprotoAuth {
+  kind: "atproto";
+  /** Handle or email used to mint sessions (com.atproto.server.createSession). */
+  identifier: string;
+  /** Keystore account holding the app password (the long-lived secret). */
+  passwordKey: string;
+  /** Keystore account holding the JSON session bundle (access/refresh JWTs + did/handle). */
+  sessionKey: string;
+}
+
 export type Auth =
   | { kind: "none" }
   | { kind: "bearer"; header: string; tokenKey: string }
-  | OAuth2Auth;
+  | OAuth2Auth
+  | AtprotoAuth;
 
 /** Which protocol adapter handles this API. */
-export type ApiKind = "openapi" | "graphql" | "soap";
+export type ApiKind = "openapi" | "graphql" | "soap" | "atproto";
 
 export interface RegistryEntry {
   /** Slug, unique, used on the CLI and in execute. */

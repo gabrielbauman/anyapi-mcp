@@ -2,10 +2,11 @@
 
 **anyapi-mcp is one local MCP server that lets your model talk to almost any
 HTTP API.** Add it once to Claude Code or Claude Desktop, then point it at any
-API you find (an OpenAPI spec, a GraphQL endpoint, or a SOAP/WSDL service) and
-your model can search and call it right away. No separate server or custom
-integration per API: one server covers everything you register, and it stays
-token-efficient however many calls a task takes.
+API you find (an OpenAPI spec, a GraphQL endpoint, a SOAP/WSDL service, or an AT
+Protocol/XRPC service like Bluesky) and your model can search and call it right
+away. No separate server or custom integration per API: one server covers
+everything you register, and it stays token-efficient however many calls a task
+takes.
 
 Under the hood it generates a typed client from the API's own description and
 exposes a small set of tools: `search` to find operations, `execute` to run a
@@ -50,20 +51,17 @@ The quickest way - builds from source, so you'll need [Deno](https://deno.com/)
 curl -fsSL https://gabrielbauman.github.io/anyapi-mcp/install.sh | sh
 ```
 
-It fetches the source, runs `deno task compile`, and drops an `anyapi-mcp`
-binary in `~/.local/bin` (override the location with `ANYAPI_MCP_BIN_DIR`).
+It fetches the source, runs `deno task compile`, drops an `anyapi-mcp` binary in
+`~/.local/bin` (override the location with `ANYAPI_MCP_BIN_DIR`), and registers
+it with Claude Code, Claude Desktop, and OpenCode so it's ready to use (skip
+that last step with `ANYAPI_MCP_NO_INSTALL=1`).
 
 Or build it yourself:
 
 ```sh
 deno task compile          # produces a self-contained ./anyapi-mcp binary
 mv ./anyapi-mcp ~/.local/bin/   # or anywhere on your PATH
-```
-
-Then point your MCP client at it automatically:
-
-```sh
-anyapi-mcp install           # adds it to Claude Code and/or Claude Desktop
+anyapi-mcp install              # register it with Claude Code, Claude Desktop, and OpenCode
 ```
 
 Or run from source during development:
@@ -76,24 +74,26 @@ deno task dev list         # = deno run -A src/main.ts list
 
 ### `add <url-or-path> [options]`
 
-Inspects the source (an OpenAPI spec, a GraphQL endpoint, or a WSDL), derives
-the base URL and host, builds a searchable operation index, generates a typed
-client, and writes a registry entry.
+Inspects the source (an OpenAPI spec, a GraphQL endpoint, a WSDL, or an atproto
+PDS/service URL), derives the base URL and host, builds a searchable operation
+index, generates a typed client, and writes a registry entry.
 
-| Option                            | Description                                                                                               |
-| --------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `--kind <openapi\|graphql\|soap>` | Protocol (default: `openapi`). `graphql` introspects an endpoint; `soap` reads a WSDL URL.                |
-| `--id <slug>`                     | Id used on the CLI and in `execute` (default: the base URL in reverse-DNS form, e.g. `com.github.api`).   |
-| `--name <name>`                   | Human-friendly name (default: spec `info.title`).                                                         |
-| `--base-url <url>`                | Override the base URL (otherwise derived from the spec's document-, path-, or operation-level `servers`). |
-| `--docs <url>`                    | Documentation URL to store and surface (not parsed).                                                      |
-| `--token`                         | Store a bearer token. Read without echo from a TTY, or piped via stdin.                                   |
-| `--oauth`                         | Treat the API as OAuth 2.0 even if the spec doesn't declare it.                                           |
-| `--auth-url` / `--token-url`      | OAuth authorize / token endpoints (override the spec's values).                                           |
-| `--scope <name>`                  | Scope to request at login (repeatable; default: the spec's scopes).                                       |
-| `--scope-separator <sep>`         | Scope separator in the authorize URL (default `" "`; Strava uses `","`).                                  |
-| `--no-auth`                       | Register without authentication.                                                                          |
-| `--force`                         | Overwrite an existing API with the same id instead of failing (e.g. to fix a wrong base URL).             |
+| Option                                     | Description                                                                                                                                                |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--kind <openapi\|graphql\|soap\|atproto>` | Protocol (default: `openapi`). `graphql` introspects an endpoint; `soap` reads a WSDL URL; `atproto` takes a PDS/service URL (e.g. `https://bsky.social`). |
+| `--id <slug>`                              | Id used on the CLI and in `execute` (default: the base URL in reverse-DNS form, e.g. `com.github.api`).                                                    |
+| `--name <name>`                            | Human-friendly name (default: spec `info.title`).                                                                                                          |
+| `--base-url <url>`                         | Override the base URL (otherwise derived from the spec's document-, path-, or operation-level `servers`).                                                  |
+| `--docs <url>`                             | Documentation URL to store and surface (not parsed).                                                                                                       |
+| `--token`                                  | Store a bearer token. Read without echo from a TTY, or piped via stdin.                                                                                    |
+| `--identifier <handle>`                    | atproto: the account handle/email to authenticate as (not a secret).                                                                                       |
+| `--app-password`                           | atproto: store an app password now. Read without echo from a TTY, or piped via stdin.                                                                      |
+| `--oauth`                                  | Treat the API as OAuth 2.0 even if the spec doesn't declare it.                                                                                            |
+| `--auth-url` / `--token-url`               | OAuth authorize / token endpoints (override the spec's values).                                                                                            |
+| `--scope <name>`                           | Scope to request at login (repeatable; default: the spec's scopes).                                                                                        |
+| `--scope-separator <sep>`                  | Scope separator in the authorize URL (default `" "`; Strava uses `","`).                                                                                   |
+| `--no-auth`                                | Register without authentication.                                                                                                                           |
+| `--force`                                  | Overwrite an existing API with the same id instead of failing (e.g. to fix a wrong base URL).                                                              |
 
 If the base URL can't be derived and would fall back to a raw spec-hosting host
 (e.g. `raw.githubusercontent.com`), `add` fails loudly instead of registering a
@@ -121,6 +121,13 @@ anyapi-mcp add https://countries.trevorblades.com/ --kind graphql
 
 # soap - read a public WSDL pointing at a live service:
 anyapi-mcp add "http://www.dneonline.com/calculator.asmx?WSDL" --kind soap
+
+# atproto - anonymous public reads (no login), via the public AppView:
+anyapi-mcp add https://public.api.bsky.app --kind atproto --id bsky-public
+
+# atproto - register your account to post / read private data (PDS + login):
+anyapi-mcp add https://bsky.social --kind atproto --id bsky --identifier you.bsky.social
+anyapi-mcp login bsky   # prompts for an app password (no echo)
 ```
 
 ### `list`
@@ -360,13 +367,26 @@ For a **SOAP** API the harness exposes one method per operation -
 `{ status, data, raw }` where `data` is the parsed SOAP `Body`. anyapi-mcp
 builds the envelope and parses the response for you.
 
+For an **atproto** (AT Protocol / lexicon / XRPC) API the harness exposes
+`client.query(nsid, params)` and `client.procedure(nsid, input)`. The NSID
+string literal selects the official `@atproto/api` types (imported type-only, so
+none of the SDK runs in the sandbox), so params, input, and the awaited result
+are all typed -
+`const tl = await client.query("app.bsky.feed.getTimeline", { limit: 20 })`
+gives a typed `tl.feed`. Public reads work anonymously - register against the
+public AppView (`https://public.api.bsky.app`) with no `--identifier`. Writes
+and your own private data need a session: register against your PDS (e.g.
+`https://bsky.social`) with `--identifier`, then run
+[`login`](#login-id-options) once to store an app password.
+
 ## Design notes & limits
 
 - **Secrets** live in the OS keystore (service `anyapi-mcp`), never in the
   registry. The registry only records keystore account names (`tokenKey`; for
-  OAuth also `clientKey`). OAuth refresh and the browser login run in the parent
-  process — the execute sandbox only ever receives a ready access token, never
-  the client secret or refresh token.
+  OAuth also `clientKey`; for atproto `passwordKey` / `sessionKey`). OAuth and
+  atproto refresh/login run in the parent process — the execute sandbox only
+  ever receives a ready access token/JWT, never the client secret, refresh
+  token, app password, or refresh JWT.
 - **Files**: registry at `$XDG_CONFIG_HOME/anyapi-mcp/apis.jsonl` (default
   `~/.config/anyapi-mcp`); generated `.d.ts` and operation indexes at
   `$XDG_CACHE_HOME/anyapi-mcp` (default `~/.cache/anyapi-mcp`).
@@ -381,18 +401,21 @@ builds the envelope and parses the response for you.
 - **Protocols & adapters**: each protocol is an in-tree `ProtocolAdapter`
   (`src/adapter.ts`) - a `prepare()` that turns a source into base URL + hosts +
   an operation index + generated types, and a `buildHarness()` that puts a typed
-  `client` in scope. OpenAPI, GraphQL, and SOAP/WSDL ship today; adding one is a
-  new arm in `src/adapters.ts`, not a plugin system. The registry, `search`, and
-  the execute sandbox are protocol-agnostic.
+  `client` in scope. OpenAPI, GraphQL, SOAP/WSDL, and AT Protocol/XRPC ship
+  today; adding one is a new arm in `src/adapters.ts`, not a plugin system. The
+  registry, `search`, and the execute sandbox are protocol-agnostic.
 - **SOAP scope**: WSDL 1.1, SOAP 1.1/1.2, document/literal, public WSDL → live
   service. Not covered: rpc/encoded, WS-Security / SOAP headers, MTOM, external
   XSD imports, WSDL 2.0.
 - **v1 scope**: OpenAPI specs in JSON or YAML - OpenAPI 3.x, or Swagger 2.0
-  auto-converted to 3.0 - plus GraphQL endpoints and SOAP/WSDL services; **no /
-  bearer / OAuth 2.0 authorization-code** auth (no PKCE, implicit,
-  client-credentials, or password grants). `search` is keyword-based over the
-  operation index - no embeddings or freeform-doc search. Each `execute` is a
-  fresh subprocess (no persistent state between calls); OAuth tokens persist in
+  auto-converted to 3.0 - plus GraphQL endpoints, SOAP/WSDL services, and AT
+  Protocol/lexicon/XRPC (the lexicon set shipped in the pinned `@atproto/api`).
+  Auth: **none / bearer / OAuth 2.0 authorization-code** (no PKCE, implicit,
+  client-credentials, or password grants), or atproto **app-password sessions**
+  (or anonymous, for public reads; atproto OAuth, whose tokens are DPoP-bound,
+  isn't supported yet). `search` is keyword-based over the operation index - no
+  embeddings or freeform-doc search. Each `execute` is a fresh subprocess (no
+  persistent state between calls); OAuth tokens and atproto sessions persist in
   the keychain and refresh automatically.
 
 ## Development
